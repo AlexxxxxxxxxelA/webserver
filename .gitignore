@@ -1,0 +1,13 @@
+build/
+build-release/
+.codex
+*.o
+*.obj
+*.exe
+*.out
+*.a
+*.so
+*.dll
+*.dylib
+.cache/
+compile_commands.json
