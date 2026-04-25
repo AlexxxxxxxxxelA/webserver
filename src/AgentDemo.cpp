@@ -408,6 +408,71 @@ std::string currentTimeString()
     return buffer;
 }
 
+std::string urlEncode(const std::string &input)
+{
+    static const char kHex[] = "0123456789ABCDEF";
+    std::string output;
+    output.reserve(input.size() * 3);
+
+    for (size_t i = 0; i < input.size(); ++i)
+    {
+        unsigned char ch = static_cast<unsigned char>(input[i]);
+        if (std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~')
+        {
+            output.push_back(static_cast<char>(ch));
+        }
+        else
+        {
+            output.push_back('%');
+            output.push_back(kHex[ch >> 4]);
+            output.push_back(kHex[ch & 0x0F]);
+        }
+    }
+
+    return output;
+}
+
+bool queryWeather(const std::string &location, std::string *result, std::string *error)
+{
+    std::string trimmedLocation = trim(location);
+    if (trimmedLocation.empty())
+    {
+        *error = "weather tool missing location";
+        return false;
+    }
+
+    std::vector<std::string> args;
+    args.push_back("curl");
+    args.push_back("--silent");
+    args.push_back("--show-error");
+    args.push_back("--fail");
+    args.push_back(std::string("https://wttr.in/") + urlEncode(trimmedLocation) + "?format=3");
+
+    std::string output;
+    int exitCode = 0;
+    if (!runCommand(args, &output, &exitCode))
+    {
+        *error = "failed to execute weather curl";
+        return false;
+    }
+
+    output = trim(output);
+    if (exitCode != 0)
+    {
+        *error = output.empty() ? "weather request failed" : output;
+        return false;
+    }
+
+    if (output.empty())
+    {
+        *error = "weather service returned empty result";
+        return false;
+    }
+
+    *result = output;
+    return true;
+}
+
 std::string normalizeMultiline(const std::string &text)
 {
     std::string normalized;
@@ -673,9 +738,10 @@ std::string AgentDemoService::handleChatLine(const std::string &connectionName, 
     std::string conversationContext = buildConversationContext(history);
 
     std::string plannerPrompt =
-        "You are an agent planner. Available tools are calculator(expression) and time(). "
+        "You are an agent planner. Available tools are calculator(expression), time(), and weather(location). "
         "You must return JSON only without markdown. "
-        "If a tool is needed, return {\"tool\":\"calculator\",\"input\":\"1+2\"} or {\"tool\":\"time\"}. "
+        "If a tool is needed, return {\"tool\":\"calculator\",\"input\":\"1+2\"}, "
+        "{\"tool\":\"time\"}, or {\"tool\":\"weather\",\"input\":\"Beijing\"}. "
         "If no tool is needed, return {\"tool\":\"none\",\"answer\":\"...\"}.";
 
     std::string plannerUserPrompt = message;
@@ -741,6 +807,20 @@ std::string AgentDemoService::handleChatLine(const std::string &connectionName, 
     else if (toolName == "time")
     {
         toolResult = currentTimeString();
+    }
+    else if (toolName == "weather")
+    {
+        std::string location;
+        if (!jsonGetString(plannerJson, "input", &location))
+        {
+            return "weather tool missing input";
+        }
+
+        std::string weatherError;
+        if (!queryWeather(location, &toolResult, &weatherError))
+        {
+            toolResult = std::string("weather error: ") + weatherError;
+        }
     }
     else
     {
