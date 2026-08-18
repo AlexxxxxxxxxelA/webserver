@@ -1,7 +1,10 @@
 #顶层Cmake，设置全局链接库以及添加子目录，和项目的头文件.h位置
 #设置最低版本和项目名称
-cmake_minimum_required(VERSION 3.0)
+cmake_minimum_required(VERSION 3.12)
 project(webserver)
+
+find_package(CURL REQUIRED)
+find_package(nlohmann_json 3.2.0 REQUIRED)
 
 #设置全局的c++标准
 set (CMAKE_CXX_STANDARD 11)

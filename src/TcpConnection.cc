@@ -33,6 +33,7 @@ TcpConnection::TcpConnection(EventLoop *loop,
     , name_(nameArg)
     , state_(kConnecting)//状态先是 kConnecting
     , reading_(true)
+    , forceCloseAfterWrite_(false)
     , socket_(new Socket(sockfd))//用这个 sockfd 创建 Socket
     , channel_(new Channel(loop, sockfd))//再用同一个 sockfd 创建 Channel
     , localAddr_(localAddr)
@@ -151,6 +152,10 @@ void TcpConnection::sendInLoop(const void *data, size_t len)
             channel_->enableWriting(); // 这里一定要注册channel的写事件 否则poller不会给channel通知epollout
         }
     }
+    else if (faultError)
+    {
+        handleClose();
+    }
 }
 
 /*
@@ -247,7 +252,12 @@ void TcpConnection::handleWrite()//当 epoll 返回这个连接可写时，就�
                     loop_->queueInLoop(
                         std::bind(writeCompleteCallback_, shared_from_this()));
                 }
-                if (state_ == kDisconnecting)
+                if (forceCloseAfterWrite_)
+                {
+                    // 异步 HTTP 响应已完整发送，主动从 TcpServer 连接表中回收。
+                    handleClose();
+                }
+                else if (state_ == kDisconnecting)
                 {
                     shutdownInLoop(); // 在当前所属的loop中把TcpConnection删除掉
                 }
@@ -255,7 +265,12 @@ void TcpConnection::handleWrite()//当 epoll 返回这个连接可写时，就�
         }
         else
         {
-            LOG_ERROR<<"TcpConnection::handleWrite";
+            // EAGAIN/EINTR 是暂时状态；其他错误继续等待不会成功，必须回收连接。
+            if (savedErrno != EWOULDBLOCK && savedErrno != EAGAIN && savedErrno != EINTR)
+            {
+                LOG_ERROR<<"TcpConnection::handleWrite errno="<<savedErrno;
+                handleClose();
+            }
         }
     }
     else
@@ -266,6 +281,11 @@ void TcpConnection::handleWrite()//当 epoll 返回这个连接可写时，就�
 
 void TcpConnection::handleClose()
 {
+    // EPOLLHUP、read==0、写错误可能相继到来；幂等检查避免重复删除同一连接。
+    if (state_ == kDisconnected)
+    {
+        return;
+    }
     LOG_INFO<<"TcpConnection::handleClose fd="<<channel_->fd()<<"state="<<(int)state_;
     setState(kDisconnected);
     channel_->disableAll();
@@ -339,5 +359,33 @@ void TcpConnection::sendFileInLoop(int fileDescriptor, off_t offset, size_t coun
         // 继续发送剩余数据
         loop_->queueInLoop(
             std::bind(&TcpConnection::sendFileInLoop, shared_from_this(), fileDescriptor, offset, remaining));
+    }
+}
+
+void TcpConnection::forceCloseAfterWrite()
+{
+    // completion 运行在业务线程，因此仍需投递到连接所属 EventLoop 操作 Channel。
+    TcpConnectionPtr self = shared_from_this();
+    loop_->runInLoop(std::bind(&TcpConnection::forceCloseAfterWriteInLoop, self));
+}
+
+void TcpConnection::forceCloseAfterWriteInLoop()
+{
+    if (state_ == kDisconnected)
+    {
+        return;
+    }
+
+    setState(kDisconnecting);
+    forceCloseAfterWrite_ = true;
+    /*
+     * send() 和本函数按顺序进入同一个 loop：
+     * - 若 send 已一次写完，此处直接 handleClose；
+     * - 若还有 outputBuffer，保持 EPOLLOUT，等 handleWrite 清空后再 close。
+     * 不能立即 close，否则大响应可能只发送一部分。
+     */
+    if (!channel_->isWriting() && outputBuffer_.readableBytes() == 0)
+    {
+        handleClose();
     }
 }

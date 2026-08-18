@@ -63,6 +63,7 @@ void HttpServer::onConnection(const TcpConnectionPtr &connection)
     else
     {
         contexts_.erase(connection->name());
+        deferredConnections_.erase(connection->name());
         LOG_INFO << "HTTP connection DOWN: " << connection->peerAddress().toIpPort().c_str();
     }
 }
@@ -82,6 +83,11 @@ void HttpServer::onMessage(const TcpConnectionPtr &connection, Buffer *buffer, T
     {
         // 只在查找 shared_ptr 时持锁，解析过程不持有全局锁。
         std::lock_guard<std::mutex> lock(contextsMutex_);
+        if (deferredConnections_.find(connection->name()) != deferredConnections_.end())
+        {
+            buffer->retrieveAll();
+            return;
+        }
         auto it = contexts_.find(connection->name());
         if (it == contexts_.end())
         {
@@ -125,11 +131,17 @@ void HttpServer::onMessage(const TcpConnectionPtr &connection, Buffer *buffer, T
         }
 
         // 只有 kComplete 才能把 request 交给业务层，错误请求不会进入路由。
-        onRequest(connection, context->request());
+        const bool deferred = onRequest(connection, context->request());
         const bool close = shouldClose(context->request());
 
         // request 交给业务层使用完以后再 reset，不能提前清空。
         context->reset();
+        if (deferred)
+        {
+            // 异步路由强制一连接一请求，丢弃客户端已经 Pipeline 进来的后续字节。
+            buffer->retrieveAll();
+            return;
+        }
         if (close || buffer->readableBytes() == 0)
         {
             return;
@@ -137,8 +149,53 @@ void HttpServer::onMessage(const TcpConnectionPtr &connection, Buffer *buffer, T
     }
 }
 
-void HttpServer::onRequest(const TcpConnectionPtr &connection, const HttpRequest &request)
+bool HttpServer::onRequest(const TcpConnectionPtr &connection, const HttpRequest &request)
 {
+    if (asyncHttpCallback_)
+    {
+        std::weak_ptr<TcpConnection> weakConnection(connection);
+        std::shared_ptr<std::atomic_bool> responded(new std::atomic_bool(false));
+        AsyncHttpResponder responder = [weakConnection, responded](HttpResponse response) {
+            /*
+             * exactly-once：业务代码即使错误地调用两次 responder，也只发送第一次。
+             * atomic_bool 是因为 completion 可能来自任意 worker 线程。
+             */
+            if (responded->exchange(true))
+            {
+                return;
+            }
+
+            TcpConnectionPtr connection = weakConnection.lock();
+            if (!connection || !connection->connected())
+            {
+                return;
+            }
+
+            // 异步学习版不继续复用连接，从根本上避免 Pipeline 响应乱序。
+            response.setCloseConnection(true);
+            Buffer output;
+            response.appendToBuffer(&output);
+            connection->send(output.retrieveAllAsString());
+            connection->forceCloseAfterWrite();
+        };
+
+        if (asyncHttpCallback_(request, responder))
+        {
+            // 校验错误可能在回调内同步响应；只有真正未完成的后台请求才记录 deferred。
+            if (!responded->load())
+            {
+                /*
+                 * deferred 不等于停止 EPOLLIN：仍保留读事件以观察 EOF，但 onMessage
+                 * 会丢弃后续请求字节。这样既不处理 Pipeline，也不会因看不到 EOF
+                 * 让连接永远留在 TcpServer::connections_。
+                 */
+                std::lock_guard<std::mutex> lock(contextsMutex_);
+                deferredConnections_.insert(connection->name());
+            }
+            return true;
+        }
+    }
+
     // 连接策略来源于请求版本和 Connection Header，业务回调不能改变它。
     const bool close = shouldClose(request);
     HttpResponse response(close);
@@ -172,6 +229,7 @@ void HttpServer::onRequest(const TcpConnectionPtr &connection, const HttpRequest
          */
         connection->shutdown();
     }
+    return false;
 }
 
 void HttpServer::sendError(const TcpConnectionPtr &connection, int statusCode,

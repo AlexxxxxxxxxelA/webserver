@@ -42,6 +42,12 @@ public:
     
     // 关闭半连接
     void shutdown();
+    /**
+     * 等待当前输出缓冲发送完成后，由服务器主动回收整条连接。
+     * 普通 shutdown() 只是 SHUT_WR 半关闭，通常等待客户端 EOF；异步 Agent 响应
+     * 明确不复用连接，因此需要写完后主动走 handleClose/removeConnection。
+     */
+    void forceCloseAfterWrite();
 
     void setConnectionCallback(const ConnectionCallback &cb)
     { connectionCallback_ = cb; }
@@ -76,11 +82,13 @@ private:
 
     void sendInLoop(const void *data, size_t len);
     void shutdownInLoop();
+    void forceCloseAfterWriteInLoop();
     void sendFileInLoop(int fileDescriptor, off_t offset, size_t count);
     EventLoop *loop_; // 这里是baseloop还是subloop由TcpServer中创建的线程数决定 若为多Reactor 该loop_指向subloop 若为单Reactor 该loop_指向baseloop
     const std::string name_;
     std::atomic_int state_;
     bool reading_;//连接是否在监听读事件
+    bool forceCloseAfterWrite_; // 部分写时，提醒 handleWrite 在缓冲清空后完整关闭
 
     // Socket Channel 这里和Acceptor类似    Acceptor => mainloop    TcpConnection => subloop
     std::unique_ptr<Socket> socket_;

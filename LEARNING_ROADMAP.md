@@ -1272,11 +1272,11 @@ src/main.cc 中 AgentServer
 - 进程重启后历史丢失。
 - 这不是持久化记忆。
 
-### 当前外部 API 调用的问题
+### 当前外部 API 调用结构
 
-目前通过外部 `curl` 子进程同步调用 DeepSeek。同步等待发生在 IO 线程时，会阻塞该 subLoop 上的其他连接。
+项目已经使用独立有界业务线程池和 libcurl 替换原来的外部 `curl` 子进程。阻塞式 HTTPS 调用运行在业务线程，不再阻塞 subLoop。
 
-理想结构：
+当前结构：
 
 ```text
 IO 线程解析请求
@@ -1301,13 +1301,13 @@ IO 线程解析请求
 - [ ] 能区分网络层、HTTP 层和 Agent 业务层。
 - [ ] 能讲清当前 Agent 一次请求的执行过程。
 - [ ] 能解释阻塞 DeepSeek 调用对 EventLoop 的影响。
-- [ ] 能画出未来业务线程池方案。
+- [ ] 能画出当前业务线程池和异步 responder 方案。
 
 ---
 
 ## 17. 阶段十三：把 Agent 接入 HTTP
 
-这一阶段是后续开发路线，目前项目尚未完成。
+这一阶段已经完成，详细的原问题、方案取舍和测试记录见 `AGENT_OPTIMIZATION_NOTES.md`。
 
 ### 目标接口
 
@@ -1330,7 +1330,7 @@ Content-Length: ...
 {"session_id":"demo-1","answer":"180"}
 ```
 
-### 推荐实现顺序
+### 已采用的实现顺序
 
 1. 先增加一个不调用 DeepSeek 的 `POST /echo`。
 2. 引入 JSON 库并安全解析 Body。
@@ -1340,6 +1340,190 @@ Content-Length: ...
 6. 使用 libcurl 替换 `fork + exec curl`。
 7. 使用 `session_id` 管理 HTTP 会话。
 8. 增加请求超时、并发限制和响应大小限制。
+
+### 本阶段源码阅读顺序
+
+不要直接从 1000 多行的 `AgentDemo.cc` 第一行读到最后。按下面的调用链阅读：
+
+```text
+1. src/main.cc::onAsyncHttpRequest
+   先看 HTTP 路由如何校验 Content-Type、JSON、session_id 和 message
+
+2. include/AgentDemo.h::submit / AgentResult / SubmitStatus
+   看清业务 API 的输入、立即返回状态和异步完成结果
+
+3. include/BoundedThreadPool.h + src/BoundedThreadPool.cc
+   理解 IO 线程如何非阻塞入队，以及 worker 如何等待和退出
+
+4. src/AgentDemo.cc::submit
+   理解 inFlight、trySubmit、异常路径和 completion
+
+5. src/AgentDemo.cc::runTurn
+   理解 planner -> tool -> final answer -> history
+
+6. src/AgentDemo.cc::DeepSeekClient::chat
+   理解 libcurl、超时、响应上限、RAII 和 JSON Response
+
+7. include/HttpServer.h + src/HttpServer.cc::onRequest
+   理解 async responder、weak_ptr 和 exactly-once
+
+8. TcpConnection::forceCloseAfterWrite
+   理解异步响应为什么必须“写完再关闭”
+```
+
+### 本阶段核心调用链
+
+```text
+curl POST /agent/run
+-> HttpContext 完成 HTTP 解析
+-> HttpServer::onRequest
+-> onAsyncHttpRequest
+-> AgentDemoService::submit
+-> BoundedThreadPool::trySubmit
+-> IO 线程返回 EventLoop
+-> worker 执行 AgentDemoService::runTurn
+-> DeepSeekClient::chat / calculator / time
+-> Completion(AgentResult)
+-> AsyncHttpResponder(HttpResponse)
+-> TcpConnection::send
+-> queueInLoop 回连接所属 IO 线程
+-> forceCloseAfterWrite
+```
+
+### 学习点一：有界业务线程池
+
+重点回答：
+
+1. 为什么不能复用 EventLoopThreadPool？
+2. 为什么队列必须有上限？
+3. 为什么 `trySubmit()` 不能阻塞等待空位？
+4. condition_variable 为什么要使用谓词？
+5. 为什么执行任务前必须释放队列 mutex？
+6. `stop()` 为什么先停止接收，再 notify，最后 join？
+
+动手实验：
+
+```text
+创建 1 个 worker、1 个排队槽：
+第一个任务阻塞运行
+第二个任务进入队列
+第三个任务应立即返回 false
+```
+
+### 学习点二：libcurl 与 RAII
+
+重点回答：
+
+1. 原来 `fork + exec curl` 在多线程进程中有什么风险？
+2. `curl_easy_perform()` 仍然阻塞，为什么现在不会阻塞 Reactor？
+3. 为什么每个 worker 请求使用独立 easy handle？
+4. `unique_ptr<CURL, Deleter>` 如何管理 C API 资源？
+5. 为什么需要连接超时、总超时和响应大小上限？
+6. 为什么 `curl_global_init()` 要在线程启动前执行？
+
+### 学习点三：异步生命周期
+
+原同步 HTTP 回调中的对象生命周期很短：
+
+```text
+HttpRequest&  -> HttpContext 内部对象，随后会 reset
+HttpResponse* -> onRequest 栈对象，函数返回后销毁
+```
+
+因此后台任务只能按值保存 `session_id` 和 `message`，不能捕获 Request 引用或 Response 指针。
+
+responder 使用：
+
+```text
+weak_ptr<TcpConnection>
++ shared atomic_bool responded
+```
+
+- weak_ptr 防止客户端提前断开后访问失效连接。
+- atomic_bool 保证响应最多发送一次。
+- Response 按值跨线程传递，不引用 worker 栈对象。
+
+### 学习点四：Session 语义一致性
+
+全局 map mutex 只保证容器线程安全，每个 Session mutex 保护 history 和 inFlight。
+
+同 session 并发时返回 409，因为只依靠 vector mutex 仍可能发生：
+
+```text
+A 读取历史 H
+B 读取历史 H
+B 先完成并追加
+A 后完成并追加
+```
+
+这没有 C++ data race，却破坏了对话顺序，属于业务语义竞态。
+
+当前资源边界：
+
+```text
+session 最大数量：1024
+message 最大长度：16 KiB
+单 session 历史：120 条 / 128 KiB
+同 session 并发：1
+```
+
+### 学习点五：异步 HTTP 连接关闭
+
+当前 `/agent/run` 使用一连接一请求，原因是完整异步 Pipeline 需要请求序号和响应排序。
+
+`forceCloseAfterWrite()` 不能直接 close：
+
+- 若响应一次写完，可以立即回收。
+- 若发生部分写，要等待 outputBuffer 清空。
+- 若立刻 close，客户端可能只收到半条 JSON Response。
+
+普通 `/health` 和 `/echo` 仍然支持 Keep-Alive；只有异步 Agent 路由采用这个限制。
+
+### 本阶段实验
+
+基础 Agent 请求：
+
+```bash
+curl -v -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id":"learn-1","message":"现在几点"}' \
+  http://127.0.0.1:18081/agent/run
+```
+
+同 session 并发实验：
+
+```text
+先提交一个未完成的 learn-1 请求，再立即提交第二个 learn-1 请求。
+预期第二个返回 409 Conflict。
+```
+
+不同 session 并发实验：
+
+```text
+同时提交 learn-1 和 learn-2。
+预期可以由不同 worker 并行执行。
+```
+
+Reactor 隔离实验：
+
+```text
+让 mock DeepSeek 故意 sleep 2 秒。
+Agent 请求等待期间连续调用 GET /health。
+预期 health 仍快速返回，证明 IO loop 未被阻塞。
+```
+
+### 本阶段常见面试问题
+
+1. epoll 已经是非阻塞的，为什么业务仍可能阻塞服务器？
+2. IO 线程池和业务线程池有什么区别？
+3. 无界线程池队列有什么风险？
+4. libcurl easy 接口是同步还是异步？为什么仍可用于 Reactor 项目？
+5. 为什么异步任务不能捕获 `HttpRequest&`？
+6. weak_ptr 在异步 responder 中解决了什么问题？
+7. 为什么同 session busy 返回 409？
+8. 为什么 Agent 响应后关闭连接？
+9. 部分写情况下如何保证先发完 Response 再关闭？
+10. 服务退出时为什么先 join 业务线程，再析构 IO loop？
 
 ### 为什么先做 `/echo`
 
@@ -1356,6 +1540,10 @@ HTTP 客户端不保证一直复用同一 TCP 连接。如果把会话绑定到 
 - [ ] Agent 请求不会阻塞 EventLoop。
 - [ ] 同一 session_id 能保持多轮上下文。
 - [ ] DeepSeek 请求失败时返回明确 HTTP 错误。
+- [ ] 能画出 IO 线程到业务线程再回 IO 线程的完整路径。
+- [ ] 能解释业务队列容量和 503 背压。
+- [ ] 能解释 weak_ptr、exactly-once 和 forceCloseAfterWrite。
+- [ ] 能说明当前不支持异步 Pipeline 的原因和后续实现方向。
 
 ---
 
@@ -1529,7 +1717,7 @@ curl -v -X POST http://127.0.0.1:18081/health
 
 ### 22.5 当前项目的不足
 
-> 当前 HTTP 是学习版 HTTP/1.1 子集，暂不支持 chunked、TLS、HTTP/2 和完整超时管理。Agent 请求目前还是同步调用外部 curl，可能阻塞 IO 线程。合理的下一步是增加独立业务线程池和 libcurl，将外部 API 调用移出 EventLoop，再通过 queueInLoop 回到连接所属线程发送响应。
+> 当前 HTTP 是学习版 HTTP/1.1 子集，暂不支持 chunked、TLS 和 HTTP/2。Agent 已通过独立有界业务线程池和 libcurl 调用 DeepSeek，阻塞调用不会占用 EventLoop；异步 `/agent/run` 为控制 Pipeline 响应排序复杂度，采用一连接一请求并在响应完整发送后主动关闭。
 
 ---
 
@@ -1541,7 +1729,7 @@ curl -v -X POST http://127.0.0.1:18081/health
 - 暂不支持 Chunked Request Body。
 - 暂不支持 HTTPS 服务端、HTTP/2、WebSocket。
 - 暂未接入 HTTP 请求读取超时和空闲连接超时。
-- HTTP 当前只有 `/health`，Agent 尚未接入 HTTP。
+- HTTP 当前提供 `/health`、`/echo` 和 `/agent/run`；异步 Agent 路由暂不复用 Keep-Alive 连接。
 - Agent 的外部 DeepSeek 调用仍可能阻塞 IO 线程。
 - 当前会话是连接级内存上下文，不是持久化长期记忆。
 - TimerQueue、LFU 和内存池尚未成为网络主链路的必要组成部分。

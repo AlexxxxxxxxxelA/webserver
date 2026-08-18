@@ -5,6 +5,7 @@ list(REMOVE_ITEM SRC_FILE ${CMAKE_CURRENT_SOURCE_DIR}/main.cc)
 
 # 创建共享库
 add_library(src_lib SHARED ${SRC_FILE})
+target_link_libraries(src_lib PUBLIC CURL::libcurl nlohmann_json::nlohmann_json)
 
 #创建可执行文件
 add_executable(main  main.cc)
