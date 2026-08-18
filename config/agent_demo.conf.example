@@ -1,0 +1,8 @@
+# Agent Demo config example
+# Copy this file to agent_demo.conf and replace the API key locally.
+# Never commit agent_demo.conf.
+
+port=18080
+deepseek_api_key=YOUR_DEEPSEEK_API_KEY
+deepseek_api_url=https://api.deepseek.com/chat/completions
+deepseek_model=deepseek-chat

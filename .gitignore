@@ -1,0 +1,20 @@
+# Local configuration containing secrets
+config/agent_demo.conf
+
+# Build outputs
+build/
+out/
+bin/
+lib/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Compiled files and runtime logs
+*.o
+*.so
+*.log
+
+# IDE and local assistant state
+.vs/
+.codex
