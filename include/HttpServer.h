@@ -13,6 +13,34 @@
 #include "HttpResponse.h"
 #include "TcpServer.h"
 
+class HttpStreamState;
+
+/**
+ * 一条 HTTP Chunked Streaming Response 的线程安全句柄。
+ *
+ * 业务层只发送“事件名 + 单行 JSON”，不能直接拼 HTTP Chunk，也不能取得 Socket。
+ * State 负责 Header、Chunk、terminal 和关闭顺序。句柄可复制到业务 worker；连接断开
+ * 后 cancelled() 变为 true，迟到事件会被拒绝。
+ */
+class HttpStreamResponder
+{
+public:
+    HttpStreamResponder() {}
+
+    bool start() const;
+    bool sendEvent(const std::string &event, const std::string &jsonData) const;
+    void finish() const;
+    void reject(HttpResponse response) const;
+    bool cancelled() const;
+
+private:
+    friend class HttpServer;
+    explicit HttpStreamResponder(const std::shared_ptr<HttpStreamState> &state)
+        : state_(state) {}
+
+    std::shared_ptr<HttpStreamState> state_;
+};
+
 /**
  * 建立在 TcpServer 之上的 HTTP 协议层。
  *
@@ -65,6 +93,12 @@ public:
      */
     using AsyncHttpCallback =
         std::function<bool(const HttpRequest &, const AsyncHttpResponder &)>;
+    /**
+     * Streaming 回调返回 true 表示接管请求。校验失败可在 start() 前 reject() 普通
+     * HttpResponse；一旦 start() 发出 200 Header，后续错误只能通过 SSE error 事件。
+     */
+    using StreamingHttpCallback =
+        std::function<bool(const HttpRequest &, const HttpStreamResponder &)>;
 
     HttpServer(EventLoop *loop,
                const InetAddress &listenAddress,
@@ -72,6 +106,8 @@ public:
 
     void setHttpCallback(const HttpCallback &callback) { httpCallback_ = callback; }
     void setAsyncHttpCallback(const AsyncHttpCallback &callback) { asyncHttpCallback_ = callback; }
+    void setStreamingHttpCallback(const StreamingHttpCallback &callback)
+    { streamingHttpCallback_ = callback; }
     void setThreadNum(int numThreads) { server_.setThreadNum(numThreads); }
     void start() { server_.start(); }
 
@@ -90,12 +126,15 @@ private:
 
     HttpCallback httpCallback_; // 例如 main.cc 中的 /health 处理函数
     AsyncHttpCallback asyncHttpCallback_;
+    StreamingHttpCallback streamingHttpCallback_;
     // 多个 subLoop 线程可能同时建立/关闭 HTTP 连接，因此映射本身需要加锁。
     std::mutex contextsMutex_;
     // key 使用 TcpConnection 唯一名称；value 持有该连接当前解析进度。
     std::unordered_map<std::string, std::shared_ptr<HttpContext>> contexts_;
     // 异步请求执行期间继续监听 EPOLLIN 以便读到 EOF，但丢弃后续请求字节。
     std::unordered_set<std::string> deferredConnections_;
+    // 活跃流状态用于在 TCP EOF/HUP 时通知业务 worker 取消上游请求。
+    std::unordered_map<std::string, std::shared_ptr<HttpStreamState>> streamStates_;
     /**
      * 声明在最后，使其最先析构并停止网络回调。
      *

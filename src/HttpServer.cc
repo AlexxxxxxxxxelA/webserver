@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <iomanip>
+#include <sstream>
 
 namespace
 {
@@ -19,6 +21,221 @@ std::string toLower(std::string value)
 }
 
 } // namespace
+
+class HttpStreamState
+{
+public:
+    enum State
+    {
+        kPending,
+        kOpen,
+        kFinished,
+        kDisconnected
+    };
+
+    explicit HttpStreamState(const TcpConnectionPtr &connection)
+        : connection_(connection), state_(kPending), emittedBytes_(0) {}
+
+    bool start()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return startLocked();
+    }
+
+    bool startLocked()
+    {
+        if (state_ != kPending)
+        {
+            return state_ == kOpen;
+        }
+        TcpConnectionPtr connection = connection_.lock();
+        if (!connection || !connection->connected())
+        {
+            state_ = kDisconnected;
+            return false;
+        }
+
+        /*
+         * Streaming 的最终长度未知，不能生成 Content-Length。HTTP Chunked 负责 Body
+         * 字节边界，SSE 的空行负责事件边界；这两层边界彼此独立。
+         */
+        static const char headers[] =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream; charset=utf-8\r\n"
+            "Cache-Control: no-cache, no-transform\r\n"
+            "X-Accel-Buffering: no\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        connection->setKeepWritingAfterPeerEof(true);
+        connection->sendQueued(headers);
+        state_ = kOpen;
+        return true;
+    }
+
+    bool sendEvent(const std::string &event, const std::string &jsonData)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // 首个 worker 事件可能早于路由线程的 start()，在同一状态锁内自动提交 Header。
+        if (state_ == kPending && !startLocked())
+        {
+            return false;
+        }
+        if (state_ != kOpen || !validEventName(event) || jsonData.size() > 64 * 1024)
+        {
+            return false;
+        }
+
+        std::string payload = "event: " + event + "\n" +
+                              "data: " + jsonData + "\n\n";
+        const std::string chunk = encodeChunk(payload);
+        TcpConnectionPtr connection = connection_.lock();
+        if (!connection || !connection->connected())
+        {
+            state_ = kDisconnected;
+            return false;
+        }
+        const size_t kMaxPendingBytes = 1024 * 1024;
+        const size_t kMaxStreamBytes = 4 * 1024 * 1024;
+        if (emittedBytes_ + payload.size() > kMaxStreamBytes ||
+            connection->pendingOutputBytes() + chunk.size() > kMaxPendingBytes)
+        {
+            /*
+             * 第一版以 Run 总输出硬上限保护内存。它比精确 low-water 背压保守，但保证
+             * 慢客户端最多让本流接受 1 MiB 数据；超限后取消并停止继续生成。
+            */
+            state_ = kDisconnected;
+            connection->sendAndForceClose(std::string());
+            return false;
+        }
+        emittedBytes_ += payload.size();
+        connection->sendQueued(chunk);
+        return true;
+    }
+
+    void finish()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != kOpen)
+        {
+            return;
+        }
+        state_ = kFinished;
+        TcpConnectionPtr connection = connection_.lock();
+        if (!connection || !connection->connected())
+        {
+            return;
+        }
+        // 0-size chunk 是 HTTP Chunked 终止符，不是 SSE 事件。
+        connection->sendAndForceClose("0\r\n\r\n");
+    }
+
+    void reject(HttpResponse response)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != kPending)
+        {
+            return;
+        }
+        state_ = kFinished;
+        TcpConnectionPtr connection = connection_.lock();
+        if (!connection || !connection->connected())
+        {
+            return;
+        }
+        response.setCloseConnection(true);
+        Buffer output;
+        response.appendToBuffer(&output);
+        connection->sendAndForceClose(output.retrieveAllAsString());
+    }
+
+    void disconnect()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        state_ = kDisconnected;
+    }
+
+    bool cancelled() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return state_ == kDisconnected || state_ == kFinished;
+    }
+
+    bool claimed() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return state_ != kPending;
+    }
+
+    bool active() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return state_ == kPending || state_ == kOpen;
+    }
+
+private:
+    static bool validEventName(const std::string &event)
+    {
+        if (event.empty() || event.size() > 64)
+        {
+            return false;
+        }
+        for (size_t i = 0; i < event.size(); ++i)
+        {
+            const unsigned char ch = static_cast<unsigned char>(event[i]);
+            if (!std::isalnum(ch) && ch != '.' && ch != '-')
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static std::string encodeChunk(const std::string &payload)
+    {
+        std::ostringstream output;
+        output << std::hex << payload.size() << "\r\n";
+        output << payload << "\r\n";
+        return output.str();
+    }
+
+    std::weak_ptr<TcpConnection> connection_;
+    mutable std::mutex mutex_;
+    State state_;
+    size_t emittedBytes_;
+};
+
+bool HttpStreamResponder::start() const
+{
+    return state_ && state_->start();
+}
+
+bool HttpStreamResponder::sendEvent(const std::string &event,
+                                    const std::string &jsonData) const
+{
+    return state_ && state_->sendEvent(event, jsonData);
+}
+
+void HttpStreamResponder::finish() const
+{
+    if (state_)
+    {
+        state_->finish();
+    }
+}
+
+void HttpStreamResponder::reject(HttpResponse response) const
+{
+    if (state_)
+    {
+        state_->reject(response);
+    }
+}
+
+bool HttpStreamResponder::cancelled() const
+{
+    return !state_ || state_->cancelled();
+}
 
 HttpServer::HttpServer(EventLoop *loop,
                        const InetAddress &listenAddress,
@@ -62,6 +279,12 @@ void HttpServer::onConnection(const TcpConnectionPtr &connection)
     }
     else
     {
+        auto stream = streamStates_.find(connection->name());
+        if (stream != streamStates_.end())
+        {
+            stream->second->disconnect();
+            streamStates_.erase(stream);
+        }
         contexts_.erase(connection->name());
         deferredConnections_.erase(connection->name());
         LOG_INFO << "HTTP connection DOWN: " << connection->peerAddress().toIpPort().c_str();
@@ -151,6 +374,31 @@ void HttpServer::onMessage(const TcpConnectionPtr &connection, Buffer *buffer, T
 
 bool HttpServer::onRequest(const TcpConnectionPtr &connection, const HttpRequest &request)
 {
+    if (streamingHttpCallback_)
+    {
+        std::shared_ptr<HttpStreamState> state(new HttpStreamState(connection));
+        HttpStreamResponder responder(state);
+        const bool handled = streamingHttpCallback_(request, responder);
+        if (handled || state->claimed())
+        {
+            if (state->active())
+            {
+                std::lock_guard<std::mutex> lock(contextsMutex_);
+                if (connection->connected())
+                {
+                    deferredConnections_.insert(connection->name());
+                    streamStates_[connection->name()] = state;
+                }
+                else
+                {
+                    // 连接可能在业务 callback 返回与登记状态之间断开。
+                    state->disconnect();
+                }
+            }
+            return true;
+        }
+    }
+
     if (asyncHttpCallback_)
     {
         std::weak_ptr<TcpConnection> weakConnection(connection);
@@ -179,7 +427,8 @@ bool HttpServer::onRequest(const TcpConnectionPtr &connection, const HttpRequest
             connection->forceCloseAfterWrite();
         };
 
-        if (asyncHttpCallback_(request, responder))
+        const bool handled = asyncHttpCallback_(request, responder);
+        if (handled || responded->load())
         {
             // 校验错误可能在回调内同步响应；只有真正未完成的后台请求才记录 deferred。
             if (!responded->load())

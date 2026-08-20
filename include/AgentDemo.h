@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <mutex>
 #include <memory>
 #include <functional>
@@ -12,6 +13,8 @@
 #include "Callbacks.h"
 #include "Timestamp.h"
 #include "BoundedThreadPool.h"
+#include "AgentRuntime.h"
+#include "ConversationContext.h"
 
 // 必须在程序启动任何后台线程前调用，完成 libcurl 全局初始化。
 void initializeAgentRuntime();
@@ -22,6 +25,9 @@ struct AgentDemoConfig
     std::string deepseekApiKey;
     std::string deepseekApiUrl;
     std::string deepseekModel;
+    bool deepseekThinkingEnabled;
+    std::string weatherApiBaseUrl;
+    std::string conversationDatabasePath;
     std::string configPath;
 };
 
@@ -40,18 +46,41 @@ public:
             kNone,
             kNotConfigured,
             kUpstreamTimeout,
+            kUpstreamAuthentication,
+            kUpstreamPaymentRequired,
+            kUpstreamRateLimited,
+            kUpstreamRejectedRequest,
+            kUpstreamUnavailable,
             kUpstreamError,
+            kInvalidUpstreamResponse,
+            kRunDeadlineExceeded,
+            kCancelled,
+            kExecutionLimit,
             kInternalError
         };
 
-        AgentResult() : error(kNone) {}
+        AgentResult()
+            : error(kNone), queueWaitMs(0), totalLatencyMs(0), historyLoadMs(0),
+              historySaveMs(0), contextEstimatedTokens(0), contextRecentTurns(0),
+              summaryUsed(false) {}
         bool ok() const { return error == kNone; }
 
         Error error;
+        std::string runId;
         std::string answer;
         std::string toolName;
         std::string toolResult;
+        // 完整保存一次 Run 的全部工具执行；toolName/toolResult 兼容旧的单工具响应。
+        std::vector<AgentToolExecution> toolExecutions;
         std::string errorMessage;
+        long queueWaitMs;
+        long totalLatencyMs;
+        AgentRunMetrics metrics;
+        long historyLoadMs;
+        long historySaveMs;
+        size_t contextEstimatedTokens;
+        size_t contextRecentTurns;
+        bool summaryUsed;
     };
 
     enum SubmitStatus
@@ -64,6 +93,11 @@ public:
 
     // Completion 运行在业务 worker 线程，调用方不能假设它在 EventLoop 线程。
     using Completion = std::function<void(AgentResult)>;
+    using SessionCreateCompletion =
+        std::function<void(bool, const ConversationSessionInfo &, const std::string &)>;
+    using SessionListCompletion =
+        std::function<void(bool, const std::vector<ConversationSessionInfo> &,
+                           const std::string &)>;
 
     AgentDemoService();
     ~AgentDemoService();
@@ -73,38 +107,61 @@ public:
     SubmitStatus submit(const std::string &sessionId,
                         const std::string &message,
                         Completion completion);
-    bool clearSession(const std::string &sessionId);
+    // eventCallback 与 Completion 一样，会同步运行在业务 worker/Provider callback 调用栈
+    // 中，必须快速且线程安全；真正的 Socket Write 由 HttpStreamResponder 投递回连接
+    // 所属 EventLoop。
+    SubmitStatus submitStreaming(
+        const std::string &sessionId,
+        const std::string &message,
+        const AgentEventCallback &eventCallback,
+        const AgentModelClient::CancelCheck &cancelled,
+        Completion completion);
+    SubmitStatus clearSessionAsync(const std::string &sessionId,
+                                   std::function<void(bool)> completion);
+    SubmitStatus createHttpSessionAsync(const std::string &title,
+                                        SessionCreateCompletion completion);
+    SubmitStatus listHttpSessionsAsync(size_t limit,
+                                      SessionListCompletion completion);
     bool isConfigured() const;
     void stop();
 
 private:
-    struct ChatMessage
-    {
-        std::string role;
-        std::string content;
-    };
-
     struct Session
     {
-        Session() : inFlight(false), lastAccess(0) {}
-        std::mutex mutex; // 保护 inFlight 和 history
+        /*
+         * 这是进程内“并发控制对象”，不是聊天历史本身。SQLite 保存 sessionId 下的
+         * 多个 Turn；每次 submit 创建一个 Run，inFlight 保证同一 Session 的 Run 不交叉。
+         */
+        Session() : inFlight(false), deleteWhenIdle(false), lastAccess(0) {}
+        std::mutex mutex; // 只保护 inFlight；完整历史存储在 SQLite
         bool inFlight;    // 保证同一对话一次只执行一个完整 Agent turn
+        bool deleteWhenIdle; // TCP 断开时置位，由业务 worker 删除持久化临时会话
         // 由 AgentDemoService::mutex_ 保护，用于容量满时淘汰最久未使用会话。
         size_t lastAccess;
-        std::vector<ChatMessage> history;
     };
 
     AgentResult runTurn(const std::shared_ptr<Session> &session,
-                        const std::string &message);
-    std::string buildConversationContext(const std::vector<ChatMessage> &history) const;
+                        const std::string &sessionId,
+                        const std::string &runId,
+                        const std::string &message,
+                        const std::chrono::steady_clock::time_point &deadline,
+                        const AgentEventCallback &eventCallback,
+                        const AgentModelClient::CancelCheck &cancelled,
+                        bool streaming);
+    SubmitStatus submitInternal(
+        const std::string &sessionId,
+        const std::string &message,
+        const AgentEventCallback &eventCallback,
+        const AgentModelClient::CancelCheck &cancelled,
+        Completion completion,
+        bool streaming);
+    AgentResult makeAgentResult(const AgentRunResult &runtimeResult);
     std::string formatChatReply(const std::string &answer,
                                 const std::string &toolName,
                                 const std::string &toolResult) const;
-    void appendHistory(const std::shared_ptr<Session> &session,
-                       const std::string &userMessage,
-                       const std::string &assistantMessage);
     std::shared_ptr<Session> getOrCreateSession(const std::string &sessionId);
     void eraseSession(const std::string &sessionId);
+    void deleteSessionWhenIdle(const std::string &sessionId);
     void eraseRejectedEmptySession(const std::string &sessionId,
                                    const std::shared_ptr<Session> &session);
 
@@ -115,6 +172,16 @@ private:
     // 只保护两个全局 map 和访问序号；绝不能持有它等待 DeepSeek。
     mutable std::mutex mutex_;
     size_t accessSequence_;
+    /*
+     * 线程职责：
+     * - IO/EventLoop：解析请求、快速校验、切换 inFlight、非阻塞入队；
+     * - business worker：SQLite、AgentRuntime、同步 libcurl 和工具执行；
+     * - 连接 EventLoop：真正 Socket Write；日志后台线程负责最终落盘。
+     * AgentRuntime 本身不创建线程。
+     */
+    std::shared_ptr<AgentRuntime> runtime_;
+    std::shared_ptr<ConversationStore> conversationStore_;
+    ContextBuilder contextBuilder_;
     BoundedThreadPool businessPool_;
 };
 

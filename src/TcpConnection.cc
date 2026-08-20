@@ -32,6 +32,8 @@ TcpConnection::TcpConnection(EventLoop *loop,
     : loop_(CheckLoopNotNull(loop))
     , name_(nameArg)
     , state_(kConnecting)//状态先是 kConnecting
+    , pendingOutputBytes_(0)
+    , keepWritingAfterPeerEof_(false)
     , reading_(true)
     , forceCloseAfterWrite_(false)
     , socket_(new Socket(sockfd))//用这个 sockfd 创建 Socket
@@ -67,6 +69,11 @@ void TcpConnection::send(const std::string &buf)
     */
     if (state_ == kConnected)
     {
+        /*
+         * 在跨线程投递前记账，因此 pendingOutputBytes 同时覆盖 outputBuffer 和尚在
+         * EventLoop pending functor 中的数据。SSE 可据此在慢客户端拖垮内存前取消。
+         */
+        pendingOutputBytes_.fetch_add(buf.size());
         if (loop_->isInLoopThread()) // 这种是对于单个reactor的情况 用户调用conn->send时 loop_即为当前线程
         {
             sendInLoop(buf.c_str(), buf.size());
@@ -93,6 +100,7 @@ void TcpConnection::sendInLoop(const void *data, size_t len)
 
     if (state_ == kDisconnected) // 之前调用过该connection的shutdown 不能再进行发送了
     {
+        pendingOutputBytes_.fetch_sub(len);
         LOG_ERROR<<"disconnected, give up writing";
         return;
     }
@@ -103,6 +111,7 @@ void TcpConnection::sendInLoop(const void *data, size_t len)
         nwrote = ::write(channel_->fd(), data, len);//也就是能直接写多少先写多少。
         if (nwrote >= 0)
         {
+            pendingOutputBytes_.fetch_sub(static_cast<size_t>(nwrote));
             remaining = len - nwrote;
             if (remaining == 0 && writeCompleteCallback_)
             {
@@ -154,6 +163,8 @@ void TcpConnection::sendInLoop(const void *data, size_t len)
     }
     else if (faultError)
     {
+        // 未写出的 remaining 不会进入 outputBuffer，撤销对应待发送字节记账。
+        pendingOutputBytes_.fetch_sub(remaining);
         handleClose();
     }
 }
@@ -224,13 +235,26 @@ void TcpConnection::handleRead(Timestamp receiveTime)
     }
     else if (n == 0) // 客户端断开
     {
-        handleClose();
+        if (keepWritingAfterPeerEof_ && state_ == kConnected)
+        {
+            /*
+             * TCP FIN 只表示客户端不再发送，并不表示它不能继续读取 SSE。流式响应保留
+             * 写方向，真正全关闭/RST 会在后续 write 错误中进入 handleClose。
+             */
+            reading_ = false;
+            channel_->disableReading();
+        }
+        else
+        {
+            handleClose();
+        }
     }
     else // 出错了
     {
         errno = savedErrno;
         LOG_ERROR<<"TcpConnection::handleRead";
         handleError();
+        handleClose();
     }
 }
 
@@ -242,6 +266,7 @@ void TcpConnection::handleWrite()//当 epoll 返回这个连接可写时，就�
         ssize_t n = outputBuffer_.writeFd(channel_->fd(), &savedErrno);
         if (n > 0)
         {
+            pendingOutputBytes_.fetch_sub(static_cast<size_t>(n));
             outputBuffer_.retrieve(n);//从缓冲区读取reable区域的数据移动readindex下标
             if (outputBuffer_.readableBytes() == 0)
             {
@@ -287,6 +312,12 @@ void TcpConnection::handleClose()
         return;
     }
     LOG_INFO<<"TcpConnection::handleClose fd="<<channel_->fd()<<"state="<<(int)state_;
+    const size_t bufferedBytes = outputBuffer_.readableBytes();
+    if (bufferedBytes > 0)
+    {
+        pendingOutputBytes_.fetch_sub(bufferedBytes);
+        outputBuffer_.retrieveAll();
+    }
     setState(kDisconnected);
     channel_->disableAll();
 
@@ -309,6 +340,10 @@ void TcpConnection::handleError()
         err = optval;
     }
     LOG_ERROR<<"TcpConnection::handleError name:"<<name_.c_str()<<"- SO_ERROR:%"<<err;
+    if (err != 0)
+    {
+        handleClose();
+    }
 }
 
 // 新增的零拷贝发送函数
@@ -360,6 +395,40 @@ void TcpConnection::sendFileInLoop(int fileDescriptor, off_t offset, size_t coun
         loop_->queueInLoop(
             std::bind(&TcpConnection::sendFileInLoop, shared_from_this(), fileDescriptor, offset, remaining));
     }
+}
+
+void TcpConnection::sendQueued(const std::string &buf)
+{
+    if (state_ != kConnected)
+    {
+        return;
+    }
+    pendingOutputBytes_.fetch_add(buf.size());
+    TcpConnectionPtr self = shared_from_this();
+    const std::string message(buf);
+    loop_->queueInLoop([self, message]() {
+        self->sendInLoop(message.data(), message.size());
+    });
+}
+
+void TcpConnection::sendAndForceClose(const std::string &buf)
+{
+    if (state_ != kConnected)
+    {
+        return;
+    }
+    pendingOutputBytes_.fetch_add(buf.size());
+    TcpConnectionPtr self = shared_from_this();
+    const std::string message(buf);
+    loop_->queueInLoop([self, message]() {
+        self->sendAndForceCloseInLoop(message);
+    });
+}
+
+void TcpConnection::sendAndForceCloseInLoop(const std::string &buf)
+{
+    sendInLoop(buf.data(), buf.size());
+    forceCloseAfterWriteInLoop();
 }
 
 void TcpConnection::forceCloseAfterWrite()

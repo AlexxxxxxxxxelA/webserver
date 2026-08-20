@@ -26,7 +26,8 @@ void HttpResponse::addHeader(const std::string &key, const std::string &value)
     std::string lower(key);
     std::transform(lower.begin(), lower.end(), lower.begin(),
                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    if (lower != "content-length" && lower != "connection")
+    if (lower != "content-length" && lower != "connection" &&
+        lower != "transfer-encoding")
     {
         headers_[key] = value;
     }

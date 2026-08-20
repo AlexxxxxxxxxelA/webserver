@@ -38,6 +38,14 @@ public:
 
     // 发送数据
     void send(const std::string &buf);
+    // Streaming 使用：即使当前就在 EventLoop，也排队以保证 Header/Event/Terminal FIFO。
+    void sendQueued(const std::string &buf);
+    // 在同一个 EventLoop task 中发送 terminal 后安排完整关闭，防止 close 越过最后数据。
+    void sendAndForceClose(const std::string &buf);
+    // 包含 outputBuffer 和尚未在 EventLoop 执行的跨线程 send 字节。
+    size_t pendingOutputBytes() const { return pendingOutputBytes_.load(); }
+    void setKeepWritingAfterPeerEof(bool enabled)
+    { keepWritingAfterPeerEof_.store(enabled); }
     void sendFile(int fileDescriptor, off_t offset, size_t count); 
     
     // 关闭半连接
@@ -83,10 +91,13 @@ private:
     void sendInLoop(const void *data, size_t len);
     void shutdownInLoop();
     void forceCloseAfterWriteInLoop();
+    void sendAndForceCloseInLoop(const std::string &buf);
     void sendFileInLoop(int fileDescriptor, off_t offset, size_t count);
     EventLoop *loop_; // 这里是baseloop还是subloop由TcpServer中创建的线程数决定 若为多Reactor 该loop_指向subloop 若为单Reactor 该loop_指向baseloop
     const std::string name_;
     std::atomic_int state_;
+    std::atomic_size_t pendingOutputBytes_;
+    std::atomic_bool keepWritingAfterPeerEof_;
     bool reading_;//连接是否在监听读事件
     bool forceCloseAfterWrite_; // 部分写时，提醒 handleWrite 在缓冲清空后完整关闭
 

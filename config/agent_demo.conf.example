@@ -5,4 +5,8 @@
 port=18080
 deepseek_api_key=YOUR_DEEPSEEK_API_KEY
 deepseek_api_url=https://api.deepseek.com/chat/completions
-deepseek_model=deepseek-chat
+deepseek_model=deepseek-v4-flash
+# Thinking 内容仅在当前 Run 内回传 DeepSeek，不写日志、SQLite 或客户端响应。
+deepseek_thinking_enabled=true
+weather_api_base_url=https://wttr.in
+conversation_database_path=data/conversations.db

@@ -1,15 +1,49 @@
-#获取当前目录下的所有源文件项目
-file(GLOB SRC_FILE ${CMAKE_CURRENT_SOURCE_DIR}/*cc)
-list(REMOVE_ITEM SRC_FILE ${CMAKE_CURRENT_SOURCE_DIR}/main.cc)
+set(WEBSERVER_CORE_SOURCES
+    Acceptor.cc
+    AgentDemo.cc
+    AgentRuntime.cc
+    BoundedThreadPool.cc
+    Buffer.cc
+    Channel.cc
+    CurrentThread.cc
+    ConversationContext.cc
+    DefaultPoller.cc
+    DeepSeekProtocol.cc
+    EPollPoller.cc
+    EventLoop.cc
+    EventLoopThread.cc
+    EventLoopThreadPool.cc
+    HttpContext.cc
+    HttpRequest.cc
+    HttpResponse.cc
+    HttpServer.cc
+    InetAddress.cc
+    Logger.cc
+    Poller.cc
+    Socket.cc
+    TcpConnection.cc
+    TcpServer.cc
+    Thread.cc
+    Timer.cc
+    TimerQueue.cc
+    Timestamp.cc
+    ${PROJECT_SOURCE_DIR}/log/AsyncLogging.cc
+    ${PROJECT_SOURCE_DIR}/log/FileUtil.cc
+    ${PROJECT_SOURCE_DIR}/log/LogFile.cc
+    ${PROJECT_SOURCE_DIR}/log/LogStream.cc
+    ${PROJECT_SOURCE_DIR}/memory/memoryPool.cc
+)
 
+add_library(webserver_core STATIC ${WEBSERVER_CORE_SOURCES})
+target_include_directories(webserver_core PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(webserver_core
+    PUBLIC
+        Threads::Threads
+        CURL::libcurl
+        nlohmann_json::nlohmann_json
+        SQLite::SQLite3
+)
 
-# 创建共享库
-add_library(src_lib SHARED ${SRC_FILE})
-target_link_libraries(src_lib PUBLIC CURL::libcurl nlohmann_json::nlohmann_json)
-
-#创建可执行文件
-add_executable(main  main.cc)
-
-#链接必要的库
-target_link_libraries(main src_lib memory_lib log_lib ${LIBS})
+add_executable(main main.cc)
+target_link_libraries(main PRIVATE webserver_core)
 

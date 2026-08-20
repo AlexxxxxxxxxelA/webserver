@@ -1,28 +1,24 @@
-#顶层Cmake，设置全局链接库以及添加子目录，和项目的头文件.h位置
-#设置最低版本和项目名称
 cmake_minimum_required(VERSION 3.12)
-project(webserver)
+project(webserver LANGUAGES CXX)
+
+include(CTest)
 
 find_package(CURL REQUIRED)
 find_package(nlohmann_json 3.2.0 REQUIRED)
+find_package(Threads REQUIRED)
+find_package(SQLite3 REQUIRED)
 
-#设置全局的c++标准
-set (CMAKE_CXX_STANDARD 11)
-set (CMAKE_CXX_STANDARD_REQUIRED True)
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-#设置头文件目录，供所有子项目使用
-include_directories(${CMAKE_SOURCE_DIR}/include)
-
-# 设置输出目录
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/lib)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/lib)
 
-#设置全局链接库
-set(LIBS
-    pthread 
-)
-
-#添加子目录使用
+# target-based CMake：依赖和 include 路径属于具体 target，不再污染整个目录树。
 add_subdirectory(src)
-add_subdirectory(memory)
-add_subdirectory(log)
+
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

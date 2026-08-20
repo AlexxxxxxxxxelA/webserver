@@ -1,20 +1,26 @@
 #include "AgentDemo.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <fstream>
+#include <iomanip>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
+#include <unistd.h>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 
 #include "Logger.h"
 #include "TcpConnection.h"
+#include "DeepSeekProtocol.h"
 
 namespace
 {
@@ -42,12 +48,34 @@ bool fileExists(const std::string &path)
     return input.good();
 }
 
+bool parseBooleanConfig(const std::string &value)
+{
+    std::string normalized = trim(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    if (normalized == "true" || normalized == "1" || normalized == "yes" ||
+        normalized == "on")
+    {
+        return true;
+    }
+    if (normalized == "false" || normalized == "0" || normalized == "no" ||
+        normalized == "off")
+    {
+        return false;
+    }
+    throw std::invalid_argument(
+        "deepseek_thinking_enabled must be true/false, 1/0, yes/no, or on/off");
+}
+
 AgentDemoConfig loadAgentDemoConfig()
 {
     AgentDemoConfig config;
     config.port = 18080;
     config.deepseekApiUrl = "https://api.deepseek.com/chat/completions";
-    config.deepseekModel = "deepseek-chat";
+    config.deepseekModel = "deepseek-v4-flash";
+    config.deepseekThinkingEnabled = true;
+    config.weatherApiBaseUrl = "https://wttr.in";
+    config.conversationDatabasePath = "data/conversations.db";
 
     const char *candidatePaths[] = {
         "agent_demo.conf",
@@ -104,13 +132,36 @@ AgentDemoConfig loadAgentDemoConfig()
             {
                 config.deepseekModel = value;
             }
+            else if (key == "deepseek_thinking_enabled")
+            {
+                config.deepseekThinkingEnabled =
+                    parseBooleanConfig(value);
+            }
+            else if (key == "weather_api_base_url")
+            {
+                config.weatherApiBaseUrl = value;
+            }
+            else if (key == "conversation_database_path")
+            {
+                config.conversationDatabasePath = value;
+            }
         }
+    }
+
+    // 手工常从 bin/ 启动；此时配置位于 ../config，数据库应落到 ../data。
+    if (config.conversationDatabasePath == "data/conversations.db" &&
+        path.compare(0, 3, "../") == 0)
+    {
+        config.conversationDatabasePath = "../data/conversations.db";
     }
 
     // 环境变量适合容器、CI 和本地测试，可覆盖文件配置且不会进入 Git。
     const char *apiKey = std::getenv("DEEPSEEK_API_KEY");
     const char *apiUrl = std::getenv("DEEPSEEK_API_URL");
     const char *model = std::getenv("DEEPSEEK_MODEL");
+    const char *thinkingEnabled = std::getenv("DEEPSEEK_THINKING_ENABLED");
+    const char *weatherApiBaseUrl = std::getenv("WEATHER_API_BASE_URL");
+    const char *conversationDatabasePath = std::getenv("CONVERSATION_DATABASE_PATH");
     if (apiKey != NULL && apiKey[0] != '\0')
     {
         config.deepseekApiKey = apiKey;
@@ -123,6 +174,19 @@ AgentDemoConfig loadAgentDemoConfig()
     {
         config.deepseekModel = model;
     }
+    if (thinkingEnabled != NULL && thinkingEnabled[0] != '\0')
+    {
+        config.deepseekThinkingEnabled =
+            parseBooleanConfig(thinkingEnabled);
+    }
+    if (weatherApiBaseUrl != NULL && weatherApiBaseUrl[0] != '\0')
+    {
+        config.weatherApiBaseUrl = weatherApiBaseUrl;
+    }
+    if (conversationDatabasePath != NULL && conversationDatabasePath[0] != '\0')
+    {
+        config.conversationDatabasePath = conversationDatabasePath;
+    }
 
     return config;
 }
@@ -133,6 +197,207 @@ std::string toLower(std::string input)
         return static_cast<char>(std::tolower(ch));
     });
     return input;
+}
+
+long elapsedMilliseconds(const std::chrono::steady_clock::time_point &begin,
+                         const std::chrono::steady_clock::time_point &end)
+{
+    return static_cast<long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count());
+}
+
+std::string createAgentRunId()
+{
+    /*
+     * Run ID 只用于日志和响应关联，不承担鉴权或幂等语义。系统时间提供跨进程可读前缀，
+     * 原子序号解决同一微秒内并发创建的冲突；真正的写操作幂等键必须由调用方提供并
+     * 持久化，不能复用这个临时观测 ID。
+     */
+    static std::atomic<unsigned long long> sequence(0);
+    const long long micros = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::ostringstream oss;
+    oss << "run-" << std::hex << micros << "-" << ++sequence;
+    return oss.str();
+}
+
+const std::string &tcpSessionNamespace()
+{
+    /*
+     * TcpServer 连接序号重启后从 #1 开始。为防止异常退出遗留的 tcp:#1 被下一次启动
+     * 的新用户加载，每个进程使用不同持久化命名空间；正常断开仍会异步删除该记录。
+     */
+    static const std::string value = []() {
+        std::ostringstream output;
+        output << "tcp:" << std::hex
+               << std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::system_clock::now().time_since_epoch()).count()
+               << ":" << static_cast<long long>(::getpid()) << ":";
+        return output.str();
+    }();
+    return value;
+}
+
+std::string tcpSessionId(const TcpConnectionPtr &connection)
+{
+    return tcpSessionNamespace() + connection->name();
+}
+
+std::string createChatSessionId()
+{
+    // Session ID 不是鉴权凭据，但随机值可以降低本地碰撞和误枚举概率。
+    std::random_device random;
+    std::ostringstream output;
+    output << "chat-" << std::hex << std::setfill('0');
+    for (int i = 0; i < 4; ++i)
+    {
+        output << std::setw(8) << static_cast<uint32_t>(random());
+    }
+    return output.str();
+}
+
+bool hasUnsafeTitleCodePoint(const std::string &title)
+{
+    for (size_t i = 0; i < title.size();)
+    {
+        const unsigned char first = static_cast<unsigned char>(title[i]);
+        size_t width = 1;
+        if ((first & 0xe0) == 0xc0) width = 2;
+        else if ((first & 0xf0) == 0xe0) width = 3;
+        else if ((first & 0xf8) == 0xf0) width = 4;
+        if (i + width > title.size()) return true;
+        uint32_t codePoint = width == 1 ? first : first & (0x7f >> width);
+        for (size_t j = 1; j < width; ++j)
+        {
+            const unsigned char next = static_cast<unsigned char>(title[i + j]);
+            if ((next & 0xc0) != 0x80) return true;
+            codePoint = (codePoint << 6) | (next & 0x3f);
+        }
+        if (codePoint < 0x20 || (codePoint >= 0x7f && codePoint <= 0x9f) ||
+            (codePoint >= 0x202a && codePoint <= 0x202e) ||
+            (codePoint >= 0x2066 && codePoint <= 0x2069))
+        {
+            return true;
+        }
+        i += width;
+    }
+    return false;
+}
+
+const char *agentResultErrorName(AgentDemoService::AgentResult::Error error)
+{
+    switch (error)
+    {
+    case AgentDemoService::AgentResult::kNone: return "none";
+    case AgentDemoService::AgentResult::kNotConfigured: return "not_configured";
+    case AgentDemoService::AgentResult::kUpstreamTimeout: return "upstream_timeout";
+    case AgentDemoService::AgentResult::kUpstreamAuthentication: return "upstream_authentication";
+    case AgentDemoService::AgentResult::kUpstreamPaymentRequired: return "upstream_payment_required";
+    case AgentDemoService::AgentResult::kUpstreamRateLimited: return "upstream_rate_limited";
+    case AgentDemoService::AgentResult::kUpstreamRejectedRequest: return "upstream_rejected_request";
+    case AgentDemoService::AgentResult::kUpstreamUnavailable: return "upstream_unavailable";
+    case AgentDemoService::AgentResult::kUpstreamError: return "upstream_error";
+    case AgentDemoService::AgentResult::kInvalidUpstreamResponse: return "invalid_upstream_response";
+    case AgentDemoService::AgentResult::kRunDeadlineExceeded: return "run_deadline_exceeded";
+    case AgentDemoService::AgentResult::kCancelled: return "cancelled";
+    case AgentDemoService::AgentResult::kExecutionLimit: return "execution_limit";
+    case AgentDemoService::AgentResult::kInternalError: return "internal_error";
+    }
+    return "unknown";
+}
+
+const char *agentResultPublicMessage(AgentDemoService::AgentResult::Error error)
+{
+    switch (error)
+    {
+    case AgentDemoService::AgentResult::kNotConfigured:
+        return "agent model is not configured";
+    case AgentDemoService::AgentResult::kUpstreamTimeout:
+        return "agent upstream request timed out";
+    case AgentDemoService::AgentResult::kUpstreamAuthentication:
+        return "agent upstream authentication failed";
+    case AgentDemoService::AgentResult::kUpstreamPaymentRequired:
+        return "agent upstream account is unavailable";
+    case AgentDemoService::AgentResult::kUpstreamRateLimited:
+        return "agent upstream rate limit exceeded";
+    case AgentDemoService::AgentResult::kUpstreamRejectedRequest:
+        return "agent upstream rejected the request";
+    case AgentDemoService::AgentResult::kUpstreamUnavailable:
+        return "agent upstream is temporarily unavailable";
+    case AgentDemoService::AgentResult::kUpstreamError:
+        return "agent upstream request failed";
+    case AgentDemoService::AgentResult::kInvalidUpstreamResponse:
+        return "agent upstream returned an invalid response";
+    case AgentDemoService::AgentResult::kRunDeadlineExceeded:
+        return "agent run deadline was exceeded";
+    case AgentDemoService::AgentResult::kCancelled:
+        return "agent stream was cancelled";
+    case AgentDemoService::AgentResult::kExecutionLimit:
+        return "agent execution budget was exceeded";
+    case AgentDemoService::AgentResult::kInternalError:
+        return "internal agent error";
+    case AgentDemoService::AgentResult::kNone:
+        return "";
+    }
+    return "agent request failed";
+}
+
+void logAgentRun(const AgentDemoService::AgentResult &result)
+{
+    /*
+     * 结构化日志只记录排障所需的元数据。禁止把用户消息、Session ID、Prompt、API Key、
+     * tool arguments/output 写入这里，防止日志变成第二份隐私数据和凭据存储。
+     * agent_trace 是一条按 run_id 关联的安全完成日志；虽然包含步骤明细，但当前没有
+     * Span、父子关系、跨进程 Trace Context 或 Exporter，不是完整分布式 Trace。
+     */
+    nlohmann::json event;
+    event["event"] = "agent.run.completed";
+    event["run_id"] = result.runId;
+    event["ok"] = result.ok();
+    event["error"] = agentResultErrorName(result.error);
+    event["queue_wait_ms"] = result.queueWaitMs;
+    event["total_latency_ms"] = result.totalLatencyMs;
+    event["model_latency_ms"] = result.metrics.modelLatencyMs;
+    event["tool_latency_ms"] = result.metrics.toolLatencyMs;
+    event["model_calls"] = result.metrics.modelExecutions.size();
+    event["tool_calls"] = result.toolExecutions.size();
+    event["history_load_ms"] = result.historyLoadMs;
+    event["history_save_ms"] = result.historySaveMs;
+    event["context_estimated_tokens"] = result.contextEstimatedTokens;
+    event["context_recent_turns"] = result.contextRecentTurns;
+    event["summary_used"] = result.summaryUsed;
+    event["usage"] = {
+        {"prompt_tokens", result.metrics.usage.promptTokens},
+        {"completion_tokens", result.metrics.usage.completionTokens},
+        {"total_tokens", result.metrics.usage.totalTokens},
+        {"cache_hit_tokens", result.metrics.usage.promptCacheHitTokens},
+        {"cache_miss_tokens", result.metrics.usage.promptCacheMissTokens},
+        {"reasoning_tokens", result.metrics.usage.reasoningTokens}
+    };
+    event["model_steps"] = nlohmann::json::array();
+    for (size_t i = 0; i < result.metrics.modelExecutions.size(); ++i)
+    {
+        const AgentModelExecution &step = result.metrics.modelExecutions[i];
+        event["model_steps"].push_back({
+            {"sequence", step.sequence},
+            {"ok", step.success},
+            {"error", agentModelErrorName(step.error)},
+            {"provider_status", step.providerStatusCode},
+            {"latency_ms", step.latencyMs},
+            {"tokens", step.usage.totalTokens}
+        });
+    }
+    event["tool_steps"] = nlohmann::json::array();
+    for (size_t i = 0; i < result.toolExecutions.size(); ++i)
+    {
+        const AgentToolExecution &step = result.toolExecutions[i];
+        event["tool_steps"].push_back({
+            {"name", step.toolName},
+            {"ok", step.success},
+            {"latency_ms", step.latencyMs}
+        });
+    }
+    LOG_INFO << "agent_trace " << event.dump();
 }
 
 class CurlGlobal
@@ -166,8 +431,10 @@ CurlGlobal &curlGlobal()
 
 struct CurlResponse
 {
-    CurlResponse() : tooLarge(false) {}
+    explicit CurlResponse(size_t limit = 1024 * 1024)
+        : maxBytes(limit), tooLarge(false) {}
     std::string body;
+    size_t maxBytes;
     bool tooLarge;
 };
 
@@ -199,18 +466,142 @@ size_t writeCurlResponse(char *data, size_t size, size_t count, void *userData)
     /*
      * libcurl 每收到一段响应数据就调用本函数，分块大小由 libcurl 决定，不等于
      * 完整 HTTP Body。必须不断 append；返回值小于 bytes 会让 libcurl 中止传输。
-     * 这里借此实现 1 MiB 硬上限，避免上游异常响应耗尽服务器内存。
+     * 这里借此实现调用方指定的硬上限：DeepSeek 非流式完整 Body 使用 3 MiB，Weather
+     * 使用 16 KiB；DeepSeek Protocol 还分别限制 reasoning/content 为 1 MiB。
      */
-    const size_t bytes = size * count;
-    const size_t kMaxResponseBytes = 1024 * 1024;
-    CurlResponse *response = static_cast<CurlResponse *>(userData);
-    if (response->body.size() + bytes > kMaxResponseBytes)
+    try
     {
-        response->tooLarge = true;
+        if (size != 0 && count > static_cast<size_t>(-1) / size)
+        {
+            return 0;
+        }
+        const size_t bytes = size * count;
+        CurlResponse *response = static_cast<CurlResponse *>(userData);
+        if (response->body.size() + bytes > response->maxBytes)
+        {
+            response->tooLarge = true;
+            return 0;
+        }
+        response->body.append(data, bytes);
+        return bytes;
+    }
+    catch (...)
+    {
+        // std::string::append 的分配异常不能越过 libcurl C ABI callback。
         return 0;
     }
-    response->body.append(data, bytes);
-    return bytes;
+}
+
+/**
+ * 使用 libcurl 查询天气。它运行在 Agent 业务 worker 中，因此同步等待不会阻塞
+ * EventLoop。与旧 mywebserver 的 fork/exec curl 相比，这里不创建子进程，也不会
+ * 把用户输入或命令参数交给 shell。
+ */
+bool queryWeather(const std::string &location, long remainingMs,
+                   const AgentModelClient::CancelCheck &cancelled,
+                   std::string *result, std::string *error, bool *timedOut)
+{
+    *timedOut = false;
+    std::string normalizedLocation = trim(location);
+    if (normalizedLocation.empty())
+    {
+        *error = "weather tool missing location";
+        return false;
+    }
+    if (normalizedLocation.size() > 128)
+    {
+        *error = "weather location is too large";
+        return false;
+    }
+
+    std::unique_ptr<CURL, CurlHandleDeleter> curl(::curl_easy_init());
+    if (!curl)
+    {
+        *error = "curl_easy_init failed";
+        return false;
+    }
+
+    // curl_easy_escape 按 URL path 规则编码空格、中文和保留字符。
+    char *escapedRaw = ::curl_easy_escape(curl.get(), normalizedLocation.c_str(),
+                                          static_cast<int>(normalizedLocation.size()));
+    if (escapedRaw == NULL)
+    {
+        *error = "failed to encode weather location";
+        return false;
+    }
+    std::unique_ptr<char, decltype(&::curl_free)> escaped(escapedRaw, &::curl_free);
+
+    std::string baseUrl = getAgentDemoConfig().weatherApiBaseUrl;
+    while (!baseUrl.empty() && baseUrl[baseUrl.size() - 1] == '/')
+    {
+        baseUrl.erase(baseUrl.size() - 1);
+    }
+    const std::string url = baseUrl + "/" + escaped.get() + "?format=3";
+
+    CurlResponse response(16 * 1024);
+    char curlError[CURL_ERROR_SIZE] = {0};
+    ::curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
+    ::curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, writeCurlResponse);
+    ::curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &response);
+    ::curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 3000L);
+    /*
+     * 工具自身最多等待 8 秒，但它还必须服从整个 Agent Run 的统一 deadline。
+     * 若前面的模型调用已经消耗大部分预算，Weather 不能重新获得完整 8 秒。
+     */
+    const long timeoutMs = std::max(1L, std::min(8000L, remainingMs));
+    ::curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, timeoutMs);
+    ::curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
+    ::curl_easy_setopt(curl.get(), CURLOPT_ERRORBUFFER, curlError);
+    if (cancelled)
+    {
+        ::curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
+        ::curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION,
+            +[](void *userData, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
+                const AgentModelClient::CancelCheck *check =
+                    static_cast<const AgentModelClient::CancelCheck *>(userData);
+                try
+                {
+                    return *check && (*check)() ? 1 : 0;
+                }
+                catch (...)
+                {
+                    return 1;
+                }
+            });
+        ::curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &cancelled);
+    }
+
+    CURLcode code = ::curl_easy_perform(curl.get());
+    long httpStatus = 0;
+    ::curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &httpStatus);
+    if (code != CURLE_OK)
+    {
+        *timedOut = code == CURLE_OPERATION_TIMEDOUT;
+        if (response.tooLarge)
+        {
+            *error = "weather response exceeded 16 KiB";
+        }
+        else
+        {
+            *error = curlError[0] != '\0' ? curlError : ::curl_easy_strerror(code);
+        }
+        return false;
+    }
+    if (httpStatus < 200 || httpStatus >= 300)
+    {
+        std::ostringstream oss;
+        oss << "weather service returned HTTP " << httpStatus;
+        *error = oss.str();
+        return false;
+    }
+
+    *result = trim(response.body);
+    if (result->empty())
+    {
+        *error = "weather service returned an empty response";
+        return false;
+    }
+    return true;
 }
 
 class Calculator
@@ -391,71 +782,296 @@ std::string normalizeMultiline(const std::string &text)
     return normalized;
 }
 
-class DeepSeekClient
+bool containsOnly(const nlohmann::json &object,
+                  const std::vector<std::string> &allowedKeys)
+{
+    for (auto it = object.begin(); it != object.end(); ++it)
+    {
+        if (std::find(allowedKeys.begin(), allowedKeys.end(), it.key()) == allowedKeys.end())
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+class CalculatorTool : public AgentTool
 {
 public:
-    bool isConfigured() const
+    std::string name() const override { return "calculator"; }
+    bool isReadOnly() const override { return true; }
+
+    std::string description() const override
+    {
+        return "Evaluate an arithmetic expression containing +, -, *, / and parentheses.";
+    }
+
+    nlohmann::json inputSchema() const override
+    {
+        return {
+            {"type", "object"},
+            {"properties", {
+                {"expression", {
+                    {"type", "string"},
+                    {"description", "Arithmetic expression, for example (1+2)*3"}
+                }}
+            }},
+            {"required", nlohmann::json::array({"expression"})},
+            {"additionalProperties", false}
+        };
+    }
+
+    AgentToolResult execute(const nlohmann::json &arguments,
+                            const AgentToolContext &) const override
+    {
+        AgentToolResult result;
+        if (!containsOnly(arguments, std::vector<std::string>(1, "expression")) ||
+            !arguments.contains("expression") || !arguments["expression"].is_string())
+        {
+            result.errorMessage = "calculator requires only a string expression";
+            return result;
+        }
+
+        const std::string expression = arguments["expression"].get<std::string>();
+        if (expression.empty() || expression.size() > 4096)
+        {
+            result.errorMessage = "calculator expression must contain 1 to 4096 bytes";
+            return result;
+        }
+        try
+        {
+            const double value = Calculator(expression).evaluate();
+            if (!std::isfinite(value))
+            {
+                result.errorMessage = "calculator result is not finite";
+                return result;
+            }
+            result.success = true;
+            result.output = formatDouble(value);
+        }
+        catch (const std::exception &ex)
+        {
+            result.errorMessage = ex.what();
+        }
+        return result;
+    }
+};
+
+class TimeTool : public AgentTool
+{
+public:
+    std::string name() const override { return "time"; }
+    bool isReadOnly() const override { return true; }
+
+    std::string description() const override
+    {
+        return "Return the server local date and time.";
+    }
+
+    nlohmann::json inputSchema() const override
+    {
+        return {
+            {"type", "object"},
+            {"properties", nlohmann::json::object()},
+            {"additionalProperties", false}
+        };
+    }
+
+    AgentToolResult execute(const nlohmann::json &arguments,
+                            const AgentToolContext &) const override
+    {
+        AgentToolResult result;
+        if (!arguments.empty())
+        {
+            result.errorMessage = "time does not accept arguments";
+            return result;
+        }
+        result.success = true;
+        result.output = currentTimeString();
+        return result;
+    }
+};
+
+class WeatherTool : public AgentTool
+{
+public:
+    std::string name() const override { return "weather"; }
+    bool isReadOnly() const override { return true; }
+
+    std::string description() const override
+    {
+        return "Get the current weather for a city or location supplied by the user.";
+    }
+
+    nlohmann::json inputSchema() const override
+    {
+        return {
+            {"type", "object"},
+            {"properties", {
+                {"location", {
+                    {"type", "string"},
+                    {"description", "City or location, for example Beijing"}
+                }}
+            }},
+            {"required", nlohmann::json::array({"location"})},
+            {"additionalProperties", false}
+        };
+    }
+
+    AgentToolResult execute(const nlohmann::json &arguments,
+                            const AgentToolContext &context) const override
+    {
+        AgentToolResult result;
+        if (!containsOnly(arguments, std::vector<std::string>(1, "location")) ||
+            !arguments.contains("location") || !arguments["location"].is_string())
+        {
+            result.errorMessage = "weather requires only a string location";
+            return result;
+        }
+
+        bool timedOut = false;
+        std::string internalError;
+        if (!queryWeather(arguments["location"].get<std::string>(),
+                          context.remainingMilliseconds(), context.cancelCheck,
+                          &result.output,
+                          &internalError, &timedOut))
+        {
+            // curl/DNS/TLS 细节不能进入模型上下文、HTTP、TCP 或工具执行轨迹。
+            result.errorMessage = timedOut
+                ? "weather service timed out" : "weather service request failed";
+            return result;
+        }
+        result.success = true;
+        return result;
+    }
+};
+
+struct DeepSeekStreamContext
+{
+    DeepSeekStreamContext(const AgentModelClient::TextDeltaCallback &delta,
+                          const AgentModelClient::ThinkingStateCallback &thinking,
+                          const AgentModelClient::CancelCheck &cancel)
+        : parser(delta, thinking), cancelCheck(cancel), parserStopped(false) {}
+
+    DeepSeekSseParser parser;
+    AgentModelClient::CancelCheck cancelCheck;
+    bool parserStopped;
+};
+
+size_t writeDeepSeekStream(char *data, size_t size, size_t count, void *userData)
+{
+    if (size != 0 && count > static_cast<size_t>(-1) / size)
+    {
+        return 0;
+    }
+    const size_t bytes = size * count;
+    DeepSeekStreamContext *context = static_cast<DeepSeekStreamContext *>(userData);
+    try
+    {
+        std::string error;
+        if (!context->parser.feed(data, bytes, &error))
+        {
+            context->parserStopped = true;
+            return 0;
+        }
+        return bytes;
+    }
+    catch (...)
+    {
+        // 任何 C++ 异常都必须在 libcurl 的 C ABI callback 边界内终止。
+        context->parserStopped = true;
+        return 0;
+    }
+}
+
+int checkDeepSeekStreamCancellation(void *userData, curl_off_t, curl_off_t,
+                                    curl_off_t, curl_off_t)
+{
+    DeepSeekStreamContext *context = static_cast<DeepSeekStreamContext *>(userData);
+    try
+    {
+        return context->cancelCheck && context->cancelCheck() ? 1 : 0;
+    }
+    catch (...)
+    {
+        return 1;
+    }
+}
+
+class DeepSeekClient : public AgentModelClient
+{
+public:
+    bool isConfigured() const override
     {
         return !getAgentDemoConfig().deepseekApiKey.empty() &&
                getAgentDemoConfig().deepseekApiKey != "YOUR_DEEPSEEK_API_KEY";
     }
 
-    bool chat(const std::string &systemPrompt,
-              const std::string &userPrompt,
-               std::string *content,
-               std::string *rawOutput,
-               std::string *error,
-               bool *timedOut) const
+    AgentModelResponse complete(
+        const std::vector<nlohmann::json> &messages,
+        const nlohmann::json &tools,
+        long timeoutMs) const override
     {
         /*
          * 这是同步阻塞函数，但它只会由 BoundedThreadPool worker 调用。
          * “同步函数”并不等于“一定阻塞 Reactor”，关键看它运行在哪个线程。
          */
-        *timedOut = false;
+        AgentModelResponse result;
         const AgentDemoConfig &config = getAgentDemoConfig();
         if (config.deepseekApiKey.empty() || config.deepseekApiKey == "YOUR_DEEPSEEK_API_KEY")
         {
-            *error = "deepseek_api_key is not configured";
-            return false;
+            result.error = AgentModelResponse::kNotConfigured;
+            result.errorMessage = "deepseek_api_key is not configured";
+            return result;
         }
 
-        // 先构造 JSON；若非法 UTF-8 导致 dump 抛异常，此时还没有 curl 资源需要清理。
-        nlohmann::json payloadJson;
-        payloadJson["model"] = config.deepseekModel;
-        payloadJson["stream"] = false;
-        payloadJson["messages"] = nlohmann::json::array({
-            {{"role", "system"}, {"content", systemPrompt}},
-            {{"role", "user"}, {"content", userPrompt}}
-        });
-        const std::string payload = payloadJson.dump();
+        const nlohmann::json payloadJson =
+            buildDeepSeekChatRequest(config.deepseekModel, messages, tools,
+                                     config.deepseekThinkingEnabled);
+
+        std::string payload;
+        try
+        {
+            payload = payloadJson.dump();
+        }
+        catch (const std::exception &)
+        {
+            result.error = AgentModelResponse::kInvalidResponse;
+            result.errorMessage = "failed to serialize DeepSeek request";
+            return result;
+        }
 
         std::unique_ptr<CURL, CurlHandleDeleter> curl(::curl_easy_init());
         if (!curl)
         {
-            *error = "curl_easy_init failed";
-            return false;
+            result.error = AgentModelResponse::kUpstreamError;
+            result.errorMessage = "curl_easy_init failed";
+            return result;
         }
 
         std::unique_ptr<curl_slist, CurlHeadersDeleter> headers(
             ::curl_slist_append(NULL, "Content-Type: application/json"));
         if (!headers)
         {
-            *error = "failed to allocate HTTP headers";
-            return false;
+            result.error = AgentModelResponse::kUpstreamError;
+            result.errorMessage = "failed to allocate HTTP headers";
+            return result;
         }
         const std::string authorization =
             std::string("Authorization: Bearer ") + config.deepseekApiKey;
         struct curl_slist *newHeaders = ::curl_slist_append(headers.get(), authorization.c_str());
         if (newHeaders == NULL)
         {
-            *error = "failed to allocate authorization header";
-            return false;
+            result.error = AgentModelResponse::kUpstreamError;
+            result.errorMessage = "failed to allocate authorization header";
+            return result;
         }
         // curl_slist_append 成功时仍返回链表头；release/reset 转移给同一 RAII 对象。
         headers.release();
         headers.reset(newHeaders);
 
-        CurlResponse response;
+        // Reasoning 和最终 Content 各自最多 1 MiB，外加 Tool Calls/Usage JSON 开销。
+        CurlResponse response(3 * 1024 * 1024);
         char curlError[CURL_ERROR_SIZE] = {0};
         ::curl_easy_setopt(curl.get(), CURLOPT_URL, config.deepseekApiUrl.c_str());
         ::curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, headers.get());
@@ -466,7 +1082,8 @@ public:
         ::curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, writeCurlResponse);
         ::curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &response);
         ::curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 5000L);
-        ::curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, 30000L);
+        ::curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS,
+                           std::max(1L, std::min(30000L, timeoutMs)));
         ::curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
         ::curl_easy_setopt(curl.get(), CURLOPT_ERRORBUFFER, curlError);
 
@@ -475,46 +1092,176 @@ public:
         long httpStatus = 0;
         ::curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &httpStatus);
 
-        *rawOutput = response.body;
         if (code != CURLE_OK)
         {
-            *timedOut = code == CURLE_OPERATION_TIMEDOUT;
+            result.providerStatusCode = static_cast<int>(httpStatus);
+            result.error = code == CURLE_OPERATION_TIMEDOUT
+                ? AgentModelResponse::kTimeout : AgentModelResponse::kUpstreamError;
             if (response.tooLarge)
             {
-                *error = "DeepSeek response exceeded 1 MiB";
+                result.errorMessage = "DeepSeek response exceeded 3 MiB";
             }
             else
             {
-                *error = curlError[0] != '\0' ? curlError : ::curl_easy_strerror(code);
+                result.errorMessage = curlError[0] != '\0'
+                    ? curlError : ::curl_easy_strerror(code);
             }
-            return false;
+            return result;
         }
-        if (httpStatus < 200 || httpStatus >= 300)
+        if (httpStatus != 0 && (httpStatus < 200 || httpStatus >= 300))
         {
-            std::ostringstream oss;
-            oss << "DeepSeek returned HTTP " << httpStatus;
-            *error = oss.str();
-            return false;
+            return classifyDeepSeekHttpError(httpStatus);
         }
 
+        AgentModelResponse parsed = parseDeepSeekChatResponse(response.body);
+        parsed.providerStatusCode = static_cast<int>(httpStatus);
+        if (config.deepseekThinkingEnabled && parsed.ok() &&
+            !parsed.toolCalls.empty() && !parsed.hasReasoningContent)
+        {
+            parsed.error = AgentModelResponse::kInvalidResponse;
+            parsed.errorMessage =
+                "DeepSeek thinking tool call omitted reasoning_content";
+        }
+        return parsed;
+    }
+
+    AgentModelResponse completeStreaming(
+        const std::vector<nlohmann::json> &messages,
+        const nlohmann::json &tools,
+        long timeoutMs,
+        const TextDeltaCallback &onDelta,
+        const ThinkingStateCallback &onThinking,
+        const CancelCheck &cancelled) const override
+    {
+        AgentModelResponse result;
+        const AgentDemoConfig &config = getAgentDemoConfig();
+        if (config.deepseekApiKey.empty() || config.deepseekApiKey == "YOUR_DEEPSEEK_API_KEY")
+        {
+            result.error = AgentModelResponse::kNotConfigured;
+            result.errorMessage = "deepseek_api_key is not configured";
+            return result;
+        }
+        if (cancelled && cancelled())
+        {
+            result.error = AgentModelResponse::kCancelled;
+            result.errorMessage = "agent stream was cancelled";
+            return result;
+        }
+
+        std::string payload;
         try
         {
-            const nlohmann::json responseJson = nlohmann::json::parse(response.body);
-            *content = responseJson.at("choices").at(0).at("message").at("content").get<std::string>();
+            payload = buildDeepSeekStreamingRequest(
+                config.deepseekModel, messages, tools,
+                config.deepseekThinkingEnabled).dump();
         }
         catch (const std::exception &)
         {
-            *error = "failed to parse DeepSeek response content";
-            return false;
+            result.error = AgentModelResponse::kInvalidResponse;
+            result.errorMessage = "failed to serialize DeepSeek streaming request";
+            return result;
         }
-        return true;
+
+        std::unique_ptr<CURL, CurlHandleDeleter> curl(::curl_easy_init());
+        if (!curl)
+        {
+            result.error = AgentModelResponse::kUpstreamError;
+            result.errorMessage = "curl_easy_init failed";
+            return result;
+        }
+        std::unique_ptr<curl_slist, CurlHeadersDeleter> headers(
+            ::curl_slist_append(NULL, "Content-Type: application/json"));
+        if (!headers)
+        {
+            result.error = AgentModelResponse::kUpstreamError;
+            result.errorMessage = "failed to allocate HTTP headers";
+            return result;
+        }
+        const std::string authorization =
+            std::string("Authorization: Bearer ") + config.deepseekApiKey;
+        curl_slist *newHeaders = ::curl_slist_append(headers.get(), authorization.c_str());
+        if (!newHeaders)
+        {
+            result.error = AgentModelResponse::kUpstreamError;
+            result.errorMessage = "failed to allocate authorization header";
+            return result;
+        }
+        headers.release();
+        headers.reset(newHeaders);
+
+        DeepSeekStreamContext context(onDelta, onThinking, cancelled);
+        char curlError[CURL_ERROR_SIZE] = {0};
+        ::curl_easy_setopt(curl.get(), CURLOPT_URL, config.deepseekApiUrl.c_str());
+        ::curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, headers.get());
+        ::curl_easy_setopt(curl.get(), CURLOPT_POST, 1L);
+        ::curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS, payload.data());
+        ::curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE,
+                           static_cast<curl_off_t>(payload.size()));
+        ::curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, writeDeepSeekStream);
+        ::curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &context);
+        ::curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+        ::curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS,
+                           std::max(1L, std::min(30000L, timeoutMs)));
+        ::curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
+        ::curl_easy_setopt(curl.get(), CURLOPT_ERRORBUFFER, curlError);
+        ::curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
+        ::curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION,
+                           checkDeepSeekStreamCancellation);
+        ::curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &context);
+
+        const CURLcode code = ::curl_easy_perform(curl.get());
+        long httpStatus = 0;
+        ::curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &httpStatus);
+
+        /*
+         * 先统一收尾 Parser，确保任何已经发出的 thinking.started 都有 completed。正常
+         * DeepSeek 非 2xx 返回 JSON Error Body，Parser 结果随后会被 HTTP 错误类别覆盖；
+         * 这也兼容“非标准上游先发 SSE reasoning、再以非 2xx 结束”的防御性场景。
+         */
+        AgentModelResponse parsed = context.parser.finish();
+        parsed.providerStatusCode = static_cast<int>(httpStatus);
+        if (httpStatus != 0 && (httpStatus < 200 || httpStatus >= 300))
+        {
+            return classifyDeepSeekHttpError(httpStatus);
+        }
+        if (config.deepseekThinkingEnabled && parsed.ok() &&
+            !parsed.toolCalls.empty() && !parsed.hasReasoningContent)
+        {
+            parsed.error = AgentModelResponse::kInvalidResponse;
+            parsed.errorMessage =
+                "DeepSeek thinking tool call omitted reasoning_content";
+        }
+        if (code == CURLE_OK)
+        {
+            return parsed;
+        }
+        if ((cancelled && cancelled()) || parsed.error == AgentModelResponse::kCancelled)
+        {
+            parsed.error = AgentModelResponse::kCancelled;
+            parsed.errorMessage = "agent stream was cancelled";
+            return parsed;
+        }
+        if (context.parserStopped)
+        {
+            return parsed;
+        }
+        parsed.error = code == CURLE_OPERATION_TIMEDOUT
+            ? AgentModelResponse::kTimeout : AgentModelResponse::kUpstreamError;
+        parsed.errorMessage = code == CURLE_OPERATION_TIMEDOUT
+            ? "DeepSeek streaming request timed out" : "DeepSeek streaming request failed";
+        return parsed;
     }
 };
 
-DeepSeekClient &deepSeekClient()
+std::shared_ptr<AgentRuntime> createAgentRuntime()
 {
-    static DeepSeekClient client;
-    return client;
+    std::shared_ptr<AgentToolRegistry> registry(new AgentToolRegistry());
+    registry->registerTool(std::shared_ptr<AgentTool>(new CalculatorTool()));
+    registry->registerTool(std::shared_ptr<AgentTool>(new TimeTool()));
+    registry->registerTool(std::shared_ptr<AgentTool>(new WeatherTool()));
+
+    std::shared_ptr<AgentModelClient> client(new DeepSeekClient());
+    return std::shared_ptr<AgentRuntime>(new AgentRuntime(client, registry));
 }
 
 } // namespace
@@ -533,6 +1280,10 @@ const AgentDemoConfig &getAgentDemoConfig()
 
 AgentDemoService::AgentDemoService()
     : accessSequence_(0)
+    , runtime_(createAgentRuntime())
+    , conversationStore_(new SQLiteConversationStore(
+          getAgentDemoConfig().conversationDatabasePath))
+    , contextBuilder_(8000, 1200, 8)
     , businessPool_(4, 64)
 {
     // main() 会在所有线程前初始化；这里保留幂等调用，避免类被其他程序单独使用时遗漏。
@@ -570,7 +1321,7 @@ void AgentDemoService::onConnection(const TcpConnectionPtr &conn)
         std::lock_guard<std::mutex> lock(mutex_);
         pendingRequests_.erase(conn->name());
     }
-    eraseSession(std::string("tcp:") + conn->name());
+    deleteSessionWhenIdle(tcpSessionId(conn));
 }
 
 void AgentDemoService::onMessage(const TcpConnectionPtr &conn, Buffer *buf, Timestamp receiveTime)
@@ -638,13 +1389,23 @@ void AgentDemoService::onMessage(const TcpConnectionPtr &conn, Buffer *buf, Time
 
         if (message == "/clear")
         {
-            if (clearSession(std::string("tcp:") + conn->name()))
-            {
-                conn->send("Conversation cleared.\n> ");
-            }
-            else
+            std::weak_ptr<TcpConnection> weakConnection(conn);
+            SubmitStatus clearStatus = clearSessionAsync(
+                tcpSessionId(conn),
+                [weakConnection](bool cleared) {
+                    TcpConnectionPtr connection = weakConnection.lock();
+                    if (!connection || !connection->connected()) return;
+                    connection->send(cleared
+                        ? "Conversation cleared.\n> "
+                        : "Failed to clear conversation.\n> ");
+                });
+            if (clearStatus == kSessionBusy)
             {
                 conn->send("Conversation is busy. Try again later.\n> ");
+            }
+            else if (clearStatus != kAccepted)
+            {
+                conn->send("Agent is busy. Try again later.\n> ");
             }
             continue;
         }
@@ -655,7 +1416,7 @@ void AgentDemoService::onMessage(const TcpConnectionPtr &conn, Buffer *buf, Time
          * 延寿；使用 weak_ptr，completion 执行时再 lock，连接不存在就丢弃结果。
          */
         SubmitStatus status = submit(
-            std::string("tcp:") + conn->name(), message,
+            tcpSessionId(conn), message,
             [this, weakConnection](AgentResult result) {
                 TcpConnectionPtr connection = weakConnection.lock();
                 if (!connection || !connection->connected())
@@ -664,11 +1425,14 @@ void AgentDemoService::onMessage(const TcpConnectionPtr &conn, Buffer *buf, Time
                 }
                 if (!result.ok())
                 {
-                    connection->send(std::string("Agent error: ") + result.errorMessage + "\n\n> ");
+                    connection->send(std::string("Agent error: ") +
+                                     agentResultPublicMessage(result.error) +
+                                     "\n[run_id] " + result.runId + "\n\n> ");
                     return;
                 }
                 connection->send(formatChatReply(result.answer, result.toolName,
-                                                 result.toolResult) + "\n\n> ");
+                                                 result.toolResult) +
+                                 "\n[run_id] " + result.runId + "\n\n> ");
             });
         if (status == kSessionBusy)
         {
@@ -687,6 +1451,33 @@ void AgentDemoService::onMessage(const TcpConnectionPtr &conn, Buffer *buf, Time
 
 AgentDemoService::SubmitStatus AgentDemoService::submit(
     const std::string &sessionId, const std::string &message, Completion completion)
+{
+    return submitInternal(sessionId, message, AgentEventCallback(),
+                          AgentModelClient::CancelCheck(), completion, false);
+}
+
+AgentDemoService::SubmitStatus AgentDemoService::submitStreaming(
+    const std::string &sessionId,
+    const std::string &message,
+    const AgentEventCallback &eventCallback,
+    const AgentModelClient::CancelCheck &cancelled,
+    Completion completion)
+{
+    if (!eventCallback || !cancelled)
+    {
+        return kInvalidRequest;
+    }
+    return submitInternal(sessionId, message, eventCallback, cancelled,
+                          completion, true);
+}
+
+AgentDemoService::SubmitStatus AgentDemoService::submitInternal(
+    const std::string &sessionId,
+    const std::string &message,
+    const AgentEventCallback &eventCallback,
+    const AgentModelClient::CancelCheck &cancelled,
+    Completion completion,
+    bool streaming)
 {
     /*
      * submit 运行在 IO 线程，只允许做快速校验、session 状态切换和非阻塞入队。
@@ -732,12 +1523,52 @@ AgentDemoService::SubmitStatus AgentDemoService::submit(
     bool accepted = false;
     try
     {
-        accepted = businessPool_.trySubmit([this, session, message, completion]() {
+        const std::string runId = createAgentRunId();
+        const std::chrono::steady_clock::time_point enqueuedAt =
+            std::chrono::steady_clock::now();
+        const std::chrono::steady_clock::time_point deadline = runtime_->deadlineFromNow();
+        accepted = businessPool_.trySubmit(
+            [this, session, sessionId, message, completion, deadline, runId, enqueuedAt,
+             eventCallback, cancelled, streaming]() {
             // 以下代码运行在业务 worker，而不是连接所属 EventLoop。
             AgentResult result;
+            const long queueWaitMs = elapsedMilliseconds(
+                enqueuedAt, std::chrono::steady_clock::now());
             try
             {
-                result = runTurn(session, message);
+                // deadline 在入队前创建，因此业务队列等待时间也计入 60 秒总预算。
+                AgentEventCallback runEventCallback;
+                if (streaming)
+                {
+                    runEventCallback = [eventCallback, runId](const AgentEvent &event) {
+                        AgentEvent enriched = event;
+                        enriched.data["run_id"] = runId;
+                        return eventCallback(enriched);
+                    };
+                    AgentEvent started;
+                    started.type = "run.started";
+                    started.data = {
+                        {"run_id", runId},
+                        {"queue_wait_ms", queueWaitMs}
+                    };
+                    if (!eventCallback(started))
+                    {
+                        result.error = AgentResult::kCancelled;
+                        result.errorMessage = "agent stream was cancelled";
+                    }
+                    else
+                    {
+                        result = runTurn(session, sessionId, runId, message, deadline,
+                                         runEventCallback,
+                                         cancelled, true);
+                    }
+                }
+                else
+                {
+                    result = runTurn(session, sessionId, runId, message, deadline,
+                                     AgentEventCallback(),
+                                     AgentModelClient::CancelCheck(), false);
+                }
             }
             catch (const std::exception &ex)
             {
@@ -749,12 +1580,43 @@ AgentDemoService::SubmitStatus AgentDemoService::submit(
                 result.error = AgentResult::kInternalError;
                 result.errorMessage = "unknown agent error";
             }
+            result.runId = runId;
+            result.queueWaitMs = queueWaitMs;
+            result.totalLatencyMs = elapsedMilliseconds(
+                enqueuedAt, std::chrono::steady_clock::now());
 
+            bool deleteAfterRun = false;
             {
                 std::lock_guard<std::mutex> lock(session->mutex);
-                session->inFlight = false;
+                deleteAfterRun = session->deleteWhenIdle;
+                if (!deleteAfterRun) session->inFlight = false;
+            }
+            if (deleteAfterRun)
+            {
+                try
+                {
+                    conversationStore_->deleteSession(sessionId);
+                }
+                catch (const std::exception &)
+                {
+                    LOG_ERROR << "failed to delete disconnected TCP conversation";
+                }
+                {
+                    std::lock_guard<std::mutex> lock(session->mutex);
+                    session->inFlight = false;
+                }
+                eraseSession(sessionId);
             }
             // 必须先复位 busy，再通知上层；否则 completion 后立即重试仍会得到 409。
+            try
+            {
+                // 可观测性是旁路能力；即使 JSON 分配失败，也不能吞掉业务 completion。
+                logAgentRun(result);
+            }
+            catch (...)
+            {
+                LOG_ERROR << "failed to serialize agent trace run_id=" << result.runId;
+            }
             completion(result);
         });
     }
@@ -776,25 +1638,122 @@ AgentDemoService::SubmitStatus AgentDemoService::submit(
     return kAccepted;
 }
 
-bool AgentDemoService::clearSession(const std::string &sessionId)
+AgentDemoService::SubmitStatus AgentDemoService::clearSessionAsync(
+    const std::string &sessionId, std::function<void(bool)> completion)
 {
+    if (sessionId.empty() || sessionId.size() > 128 || !completion)
+    {
+        return kInvalidRequest;
+    }
+    const bool tcpSession = sessionId.compare(0, 4, "tcp:") == 0;
+    for (size_t i = 0; i < sessionId.size(); ++i)
+    {
+        const unsigned char ch = static_cast<unsigned char>(sessionId[i]);
+        if (!std::isalnum(ch) && ch != '-' && ch != '_' && ch != '.' && ch != ':' &&
+            !(tcpSession && ch == '#'))
+        {
+            return kInvalidRequest;
+        }
+    }
     std::shared_ptr<Session> session = getOrCreateSession(sessionId);
-    if (!session)
+    if (!session) return kQueueFull;
     {
-        return false;
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (session->inFlight) return kSessionBusy;
+        session->inFlight = true;
     }
-    std::lock_guard<std::mutex> lock(session->mutex);
-    if (session->inFlight)
+    const bool accepted = businessPool_.trySubmit(
+        [this, sessionId, session, completion]() {
+            bool cleared = false;
+            try
+            {
+                conversationStore_->deleteSession(sessionId);
+                cleared = true;
+            }
+            catch (const std::exception &)
+            {
+                LOG_ERROR << "failed to clear persisted conversation";
+            }
+            {
+                std::lock_guard<std::mutex> lock(session->mutex);
+                session->inFlight = false;
+            }
+            completion(cleared);
+        });
+    if (!accepted)
     {
-        return false;
+        std::lock_guard<std::mutex> lock(session->mutex);
+        session->inFlight = false;
+        return kQueueFull;
     }
-    session->history.clear();
-    return true;
+    return kAccepted;
+}
+
+AgentDemoService::SubmitStatus AgentDemoService::createHttpSessionAsync(
+    const std::string &title, SessionCreateCompletion completion)
+{
+    const std::string normalizedTitle = trim(title);
+    if (!completion || normalizedTitle.size() > 256)
+    {
+        return kInvalidRequest;
+    }
+    if (hasUnsafeTitleCodePoint(normalizedTitle)) return kInvalidRequest;
+    const bool accepted = businessPool_.trySubmit(
+        [this, normalizedTitle, completion]() {
+        ConversationSessionInfo info;
+        std::string error;
+        bool created = false;
+        try
+        {
+            info.sessionId = createChatSessionId();
+            info.title = normalizedTitle.empty() ? "新聊天" : normalizedTitle;
+            conversationStore_->createSession(
+                std::string("http:") + info.sessionId, info.title);
+            created = true;
+        }
+        catch (const std::exception &)
+        {
+            error = "failed to create chat session";
+            LOG_ERROR << error;
+        }
+        completion(created, info, error);
+    });
+    return accepted ? kAccepted : kQueueFull;
+}
+
+AgentDemoService::SubmitStatus AgentDemoService::listHttpSessionsAsync(
+    size_t limit, SessionListCompletion completion)
+{
+    if (!completion || limit == 0 || limit > 100)
+    {
+        return kInvalidRequest;
+    }
+    const bool accepted = businessPool_.trySubmit([this, limit, completion]() {
+        std::vector<ConversationSessionInfo> sessions;
+        std::string error;
+        bool loaded = false;
+        try
+        {
+            sessions = conversationStore_->listSessions("http:", limit);
+            for (size_t i = 0; i < sessions.size(); ++i)
+            {
+                sessions[i].sessionId.erase(0, 5); // 隐藏 Store 内部 http: 命名空间。
+            }
+            loaded = true;
+        }
+        catch (const std::exception &)
+        {
+            error = "failed to list chat sessions";
+            LOG_ERROR << error;
+        }
+        completion(loaded, sessions, error);
+    });
+    return accepted ? kAccepted : kQueueFull;
 }
 
 bool AgentDemoService::isConfigured() const
 {
-    return deepSeekClient().isConfigured();
+    return runtime_->isConfigured();
 }
 
 std::shared_ptr<AgentDemoService::Session>
@@ -850,6 +1809,44 @@ void AgentDemoService::eraseSession(const std::string &sessionId)
     sessions_.erase(sessionId);
 }
 
+void AgentDemoService::deleteSessionWhenIdle(const std::string &sessionId)
+{
+    std::shared_ptr<Session> session;
+    {
+        // 保持项目统一锁顺序：全局 map mutex -> 单 Session mutex。
+        std::lock_guard<std::mutex> mapLock(mutex_);
+        auto it = sessions_.find(sessionId);
+        if (it == sessions_.end()) return;
+        session = it->second;
+        std::lock_guard<std::mutex> sessionLock(session->mutex);
+        session->deleteWhenIdle = true;
+        if (session->inFlight) return;
+        session->inFlight = true;
+    }
+
+    const bool accepted = businessPool_.trySubmit([this, sessionId, session]() {
+        try
+        {
+            conversationStore_->deleteSession(sessionId);
+        }
+        catch (const std::exception &)
+        {
+            LOG_ERROR << "failed to delete idle TCP conversation";
+        }
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            session->inFlight = false;
+        }
+        eraseSession(sessionId);
+    });
+    if (!accepted)
+    {
+        // 队列过载时不能在 IO 线程退化为同步 SQLite；保留内存标记供后续任务收尾。
+        std::lock_guard<std::mutex> lock(session->mutex);
+        session->inFlight = false;
+    }
+}
+
 void AgentDemoService::eraseRejectedEmptySession(
     const std::string &sessionId, const std::shared_ptr<Session> &session)
 {
@@ -861,174 +1858,193 @@ void AgentDemoService::eraseRejectedEmptySession(
         return;
     }
     std::lock_guard<std::mutex> sessionLock(session->mutex);
-    if (!session->inFlight && session->history.empty() && session.use_count() == 2)
+    if (!session->inFlight && session.use_count() == 2)
     {
         sessions_.erase(it);
     }
 }
 
 AgentDemoService::AgentResult AgentDemoService::runTurn(
-    const std::shared_ptr<Session> &session, const std::string &message)
+    const std::shared_ptr<Session> &session,
+    const std::string &sessionId,
+    const std::string &runId,
+    const std::string &message,
+    const std::chrono::steady_clock::time_point &deadline,
+    const AgentEventCallback &eventCallback,
+    const AgentModelClient::CancelCheck &cancelled,
+    bool streaming)
 {
     /*
-     * 一个 Agent turn：复制历史 -> planner -> 可选工具 -> 可选第二次模型请求
-     * -> 追加 user/assistant 历史。耗时步骤全部在业务线程执行。
+     * Service 只负责取得 Session 快照并保存最终对话；Tool Calling 的消息状态机交给
+     * AgentRuntime。这样 Session 锁不会覆盖任何模型或工具等待时间，其他 Session
+     * 仍可由不同 worker 并行执行。
      */
-    AgentResult result;
-    std::vector<ChatMessage> history;
+    (void)session;
+    const std::chrono::steady_clock::time_point loadBegin =
+        std::chrono::steady_clock::now();
+    // 0 表示全部未摘要 Turn；正常每次超过 8 个便压缩，所以常态只有 8-9 个。
+    ConversationSnapshot snapshot = conversationStore_->load(sessionId, 0);
+
+    /*
+     * 每次成功保存后未摘要 Turn 通常最多为 9 个。达到阈值时，把较早完整 Turn 摘要，
+     * 最近 8 个仍保留原文。摘要失败属于派生数据失败，不阻止本次使用原始历史。
+     */
+    if (snapshot.turns.size() > contextBuilder_.recentTurnsToKeep())
     {
-        std::lock_guard<std::mutex> lock(session->mutex);
-        history = session->history;
-    }
-
-    std::string plannerOutput;
-    std::string plannerError;
-    std::string plannerContent;
-    std::string conversationContext = buildConversationContext(history);
-
-    std::string plannerPrompt =
-        "You are an agent planner. Available tools are calculator(expression) and time(). "
-        "You must return JSON only without markdown. "
-        "If a tool is needed, return {\"tool\":\"calculator\",\"input\":\"1+2\"} or {\"tool\":\"time\"}. "
-        "If no tool is needed, return {\"tool\":\"none\",\"answer\":\"...\"}.";
-
-    std::string plannerUserPrompt = message;
-    if (!conversationContext.empty())
-    {
-        plannerUserPrompt = std::string("Conversation history:\n") + conversationContext +
-                            "\nCurrent user message:\n" + message;
-    }
-
-    bool timedOut = false;
-    if (!deepSeekClient().chat(plannerPrompt, plannerUserPrompt, &plannerContent,
-                               &plannerOutput, &plannerError, &timedOut))
-    {
-        result.error = timedOut ? AgentResult::kUpstreamTimeout :
-            (isConfigured() ? AgentResult::kUpstreamError : AgentResult::kNotConfigured);
-        result.errorMessage = plannerError;
-        return result;
-    }
-
-    nlohmann::json plannerJson;
-    try
-    {
-        plannerJson = nlohmann::json::parse(plannerContent);
-    }
-    catch (const std::exception &)
-    {
-        std::string fallback = normalizeMultiline(plannerContent);
-        appendHistory(session, message, fallback);
-        result.answer = fallback;
-        result.toolName = "none";
-        return result;
-    }
-
-    if (!plannerJson.is_object() || !plannerJson.contains("tool") ||
-        !plannerJson["tool"].is_string())
-    {
-        std::string fallback = normalizeMultiline(plannerContent);
-        appendHistory(session, message, fallback);
-        result.answer = fallback;
-        result.toolName = "none";
-        return result;
-    }
-
-    std::string toolName = trim(plannerJson["tool"].get<std::string>());
-    if (toolName == "none")
-    {
-        std::string answer;
-        if (!plannerJson.contains("answer") || !plannerJson["answer"].is_string())
-        {
-            answer = plannerContent;
-        }
-        else
-        {
-            answer = plannerJson["answer"].get<std::string>();
-        }
-        answer = normalizeMultiline(answer);
-        appendHistory(session, message, answer);
-        result.answer = answer;
-        result.toolName = "none";
-        return result;
-    }
-
-    std::string toolResult;
-    if (toolName == "calculator")
-    {
-        if (!plannerJson.contains("input") || !plannerJson["input"].is_string())
-        {
-            result.error = AgentResult::kInternalError;
-            result.errorMessage = "calculator tool missing input";
-            return result;
-        }
-        std::string expression = plannerJson["input"].get<std::string>();
-        if (expression.size() > 4096)
-        {
-            result.error = AgentResult::kInternalError;
-            result.errorMessage = "calculator input is too large";
-            return result;
-        }
-
+        const size_t compactCount =
+            snapshot.turns.size() - contextBuilder_.recentTurnsToKeep();
+        std::vector<ConversationTurn> oldTurns(
+            snapshot.turns.begin(), snapshot.turns.begin() + compactCount);
+        const ConversationSummary summary =
+            contextBuilder_.extendSummary(snapshot.summary, oldTurns);
         try
         {
-            Calculator calculator(expression);
-            toolResult = formatDouble(calculator.evaluate());
+            conversationStore_->saveSummary(sessionId, summary);
+            snapshot.summary = summary;
+            snapshot.turns.erase(snapshot.turns.begin(),
+                                 snapshot.turns.begin() + compactCount);
         }
-        catch (const std::exception &ex)
+        catch (const std::exception &)
         {
-            toolResult = std::string("calculator error: ") + ex.what();
+            LOG_ERROR << "failed to save conversation summary";
         }
     }
-    else if (toolName == "time")
+    const ContextBuildResult context = contextBuilder_.build(snapshot);
+    const long historyLoadMs = elapsedMilliseconds(
+        loadBegin, std::chrono::steady_clock::now());
+
+    const AgentRunResult runtimeResult = streaming
+        ? runtime_->runStreamingUntil(context.history, message, deadline,
+                                      eventCallback, cancelled)
+        : runtime_->runUntil(context.history, message, deadline);
+    if (streaming && cancelled && cancelled())
     {
-        toolResult = currentTimeString();
-    }
-    else
-    {
-        result.error = AgentResult::kInternalError;
-        result.errorMessage = std::string("unsupported tool: ") + toolName;
+        AgentRunResult cancelledResult = runtimeResult;
+        cancelledResult.error = AgentRunResult::kCancelled;
+        cancelledResult.errorMessage = "agent stream was cancelled";
+        cancelledResult.answer.clear();
+        AgentResult result = makeAgentResult(cancelledResult);
+        result.historyLoadMs = historyLoadMs;
+        result.contextEstimatedTokens = context.estimatedTokens;
+        result.contextRecentTurns = context.recentTurns;
+        result.summaryUsed = context.summaryUsed;
         return result;
     }
-
-    std::string finalContent;
-    std::string finalRaw;
-    std::string finalError;
-    std::ostringstream toolUserPrompt;
-    toolUserPrompt << "User question: " << message << "\n"
-                   << "Tool used: " << toolName << "\n"
-                   << "Tool result: " << toolResult << "\n"
-                   << "Please answer in concise Chinese.";
-
-    timedOut = false;
-    if (!deepSeekClient().chat(
-            "You are a helpful assistant. Use the provided tool result to answer accurately.",
-            conversationContext.empty()
-                ? toolUserPrompt.str()
-                : std::string("Conversation history:\n") + conversationContext + "\n" + toolUserPrompt.str(),
-            &finalContent,
-            &finalRaw,
-            &finalError,
-            &timedOut))
+    AgentResult result = makeAgentResult(runtimeResult);
+    result.historyLoadMs = historyLoadMs;
+    result.contextEstimatedTokens = context.estimatedTokens;
+    result.contextRecentTurns = context.recentTurns;
+    result.summaryUsed = context.summaryUsed;
+    if (result.ok())
     {
-        // 第二次模型整理失败时降级返回本地工具结果，保证工具本身的有效结果可用。
-        finalContent = std::string("工具结果：") + toolResult;
+        const std::chrono::steady_clock::time_point saveBegin =
+            std::chrono::steady_clock::now();
+        ConversationTurn turn;
+        /*
+         * 只有成功 Run 才尝试生成持久化 Turn。当前用 runId 作为 turnId 便于把数据库
+         * 历史与 agent_trace 关联；失败或取消 Run 不会成为 Conversation Turn。
+         */
+        turn.turnId = runId;
+        turn.userMessage = message;
+        turn.assistantMessage = result.answer;
+        turn.toolExecutions = result.toolExecutions;
+        TokenEstimator estimator;
+        turn.estimatedTokens = estimator.estimateTurn(turn);
+        try
+        {
+            conversationStore_->saveTurn(sessionId, turn);
+        }
+        catch (const std::exception &)
+        {
+            // 保留已经完成的模型、工具和 Token metrics，方便定位持久化故障。
+            result.error = AgentResult::kInternalError;
+            result.errorMessage = "failed to persist conversation turn";
+        }
+        result.historySaveMs = elapsedMilliseconds(
+            saveBegin, std::chrono::steady_clock::now());
     }
-    finalContent = normalizeMultiline(finalContent);
-    appendHistory(session, message, finalContent);
-    result.answer = finalContent;
-    result.toolName = toolName;
-    result.toolResult = toolResult;
     return result;
 }
 
-std::string AgentDemoService::buildConversationContext(const std::vector<ChatMessage> &history) const
+AgentDemoService::AgentResult AgentDemoService::makeAgentResult(
+    const AgentRunResult &runtimeResult)
 {
-    std::ostringstream oss;
-    for (size_t i = 0; i < history.size(); ++i)
+    AgentResult result;
+    result.toolExecutions = runtimeResult.toolExecutions;
+    result.metrics = runtimeResult.metrics;
+    if (!runtimeResult.ok())
     {
-        oss << history[i].role << ": " << history[i].content << "\n";
+        switch (runtimeResult.error)
+        {
+        case AgentRunResult::kNotConfigured:
+            result.error = AgentResult::kNotConfigured;
+            break;
+        case AgentRunResult::kUpstreamTimeout:
+            result.error = AgentResult::kUpstreamTimeout;
+            break;
+        case AgentRunResult::kUpstreamError:
+            switch (runtimeResult.upstreamError)
+            {
+            case AgentModelResponse::kAuthentication:
+                result.error = AgentResult::kUpstreamAuthentication;
+                break;
+            case AgentModelResponse::kPaymentRequired:
+                result.error = AgentResult::kUpstreamPaymentRequired;
+                break;
+            case AgentModelResponse::kRateLimited:
+                result.error = AgentResult::kUpstreamRateLimited;
+                break;
+            case AgentModelResponse::kRejectedRequest:
+                result.error = AgentResult::kUpstreamRejectedRequest;
+                break;
+            case AgentModelResponse::kUnavailable:
+                result.error = AgentResult::kUpstreamUnavailable;
+                break;
+            default:
+                result.error = AgentResult::kUpstreamError;
+                break;
+            }
+            break;
+        case AgentRunResult::kInvalidModelResponse:
+            result.error = AgentResult::kInvalidUpstreamResponse;
+            break;
+        case AgentRunResult::kDeadlineExceeded:
+            result.error = AgentResult::kRunDeadlineExceeded;
+            break;
+        case AgentRunResult::kCancelled:
+            result.error = AgentResult::kCancelled;
+            break;
+        case AgentRunResult::kBudgetExceeded:
+            result.error = AgentResult::kExecutionLimit;
+            break;
+        case AgentRunResult::kInternalError:
+        default:
+            result.error = AgentResult::kInternalError;
+            break;
+        }
+        result.errorMessage = runtimeResult.errorMessage;
+        return result;
     }
-    return oss.str();
+
+    result.answer = normalizeMultiline(runtimeResult.answer);
+    if (result.answer.empty())
+    {
+        result.error = AgentResult::kUpstreamError;
+        result.errorMessage = "model returned an empty final answer";
+        return result;
+    }
+
+    if (result.toolExecutions.empty())
+    {
+        result.toolName = "none";
+    }
+    else
+    {
+        const AgentToolExecution &last = result.toolExecutions.back();
+        result.toolName = last.toolName;
+        result.toolResult = last.output;
+    }
+    return result;
 }
 
 std::string AgentDemoService::formatChatReply(const std::string &answer,
@@ -1046,40 +2062,4 @@ std::string AgentDemoService::formatChatReply(const std::string &answer,
         }
     }
     return oss.str();
-}
-
-void AgentDemoService::appendHistory(const std::shared_ptr<Session> &session,
-                                     const std::string &userMessage,
-                                     const std::string &assistantMessage)
-{
-    std::lock_guard<std::mutex> lock(session->mutex);
-    std::vector<ChatMessage> &history = session->history;
-    ChatMessage user;
-    user.role = "user";
-    user.content = userMessage;
-    history.push_back(user);
-
-    ChatMessage assistant;
-    assistant.role = "assistant";
-    assistant.content = assistantMessage;
-    history.push_back(assistant);
-
-    const size_t kMaxMessages = 120;
-    if (history.size() > kMaxMessages)
-    {
-        history.erase(history.begin(), history.begin() + (history.size() - kMaxMessages));
-    }
-
-    // 除消息条数外再限制总字节数，避免少量超长消息长期占用大量内存。
-    const size_t kMaxHistoryBytes = 128 * 1024;
-    size_t bytes = 0;
-    for (size_t i = 0; i < history.size(); ++i)
-    {
-        bytes += history[i].role.size() + history[i].content.size();
-    }
-    while (!history.empty() && bytes > kMaxHistoryBytes)
-    {
-        bytes -= history.front().role.size() + history.front().content.size();
-        history.erase(history.begin());
-    }
 }

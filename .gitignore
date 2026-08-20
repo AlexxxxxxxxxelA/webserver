@@ -14,7 +14,18 @@ cmake_install.cmake
 *.o
 *.so
 *.log
+data/*.db
+data/*.db-shm
+data/*.db-wal
 
 # IDE and local assistant state
 .vs/
 .codex
+__pycache__/
+*.pyc
+
+# Local resume artifacts containing personal information
+秋招简历final.pdf
+秋招简历final_项目更新版.pdf
+秋招简历final_项目更新版.html
+resume_photo.jpeg

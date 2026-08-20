@@ -68,15 +68,20 @@ void Logger::Impl::formatTime()
     time_t seconds = static_cast<time_t>(now.microSecondsSinceEpoch() / Timestamp::kMicroSecondsPerSecond);
     int microseconds = static_cast<int>(now.microSecondsSinceEpoch() % Timestamp::kMicroSecondsPerSecond);
     //计算剩余微秒数
-    struct tm *tm_timer = localtime(&seconds);
+    /*
+     * localtime() 返回进程共享的静态 tm，多 IO/Agent worker 同时写日志会产生数据竞争。
+     * localtime_r() 把结果写入当前栈对象，适合当前多线程日志调用场景。
+     */
+    struct tm tm_timer;
+    localtime_r(&seconds, &tm_timer);
     // 写入此线程存储的时间buf中
     snprintf(ThreadInfo::t_timer, sizeof(ThreadInfo::t_timer), "%4d/%02d/%02d %02d:%02d:%02d",
-             tm_timer->tm_year + 1900,
-             tm_timer->tm_mon + 1,
-             tm_timer->tm_mday,
-             tm_timer->tm_hour,
-             tm_timer->tm_min,
-             tm_timer->tm_sec);
+              tm_timer.tm_year + 1900,
+              tm_timer.tm_mon + 1,
+              tm_timer.tm_mday,
+              tm_timer.tm_hour,
+              tm_timer.tm_min,
+              tm_timer.tm_sec);
     // 更新最后一次时间调用
     ThreadInfo::t_lastSecond = seconds;
 
@@ -99,8 +104,20 @@ Logger::~Logger()
 {
     impl_.finish();
     const LogStream::Buffer &buffer = stream().buffer();
-    // 输出(默认项终端输出)
-    g_output(buffer.data(), buffer.length());
+    /*
+     * 析构函数默认 noexcept。若异步日志 append 因内存分配失败抛异常而越过析构函数，
+     * 进程会直接 std::terminate。日志是旁路能力，必须在这里隔离 output sink 异常，
+     * 让 Agent completion 和网络生命周期继续执行。
+     */
+    try
+    {
+        g_output(buffer.data(), buffer.length());
+    }
+    catch (...)
+    {
+        static const char fallback[] = "logger output failed\n";
+        fwrite(fallback, 1, sizeof(fallback) - 1, stderr);
+    }
     // FATAL情况终止程序
     if (impl_.level_ == FATAL)
     {

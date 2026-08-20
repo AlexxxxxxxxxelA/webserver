@@ -76,7 +76,7 @@ C++ 基础可以在看不懂具体语法时回到阶段一补充；日志、Agen
 | 端口 | 协议 | 用途 |
 |---|---|---|
 | `18080` | TCP 按行文本协议 | 原有 Agent Demo，支持 `/health`、`/clear`、`/quit` |
-| `18081` | 基础 HTTP/1.1 | 当前提供 `GET /health` |
+| `18081` | 基础 HTTP/1.1 | `/health`、`/echo`、Agent JSON/SSE、会话清除 |
 
 整体分层如下：
 
@@ -1257,10 +1257,11 @@ src/main.cc 中 AgentServer
 -> TcpConnection 收到一行
 -> AgentDemoService::onMessage
 -> 按 '\n' 拆分命令
--> 保存/读取连接级会话历史
--> 请求 DeepSeek 规划工具
--> calculator 或 time
--> 必要时再次请求 DeepSeek
+-> worker 从 SQLite 加载连接级会话历史
+-> ContextBuilder 按预算选择历史
+-> DeepSeek 原生 Tool Calls
+-> calculator/time/weather
+-> 成功 Turn 事务保存到 SQLite
 -> TcpConnection::send 返回答案
 ```
 
@@ -1268,9 +1269,9 @@ src/main.cc 中 AgentServer
 
 - 以连接名称作为会话 key。
 - 同一 TCP 长连接支持多轮对话。
-- 连接断开后删除历史。
-- 进程重启后历史丢失。
-- 这不是持久化记忆。
+- TCP Session ID 还包含进程命名空间，避免异常重启后连接序号复用旧历史。
+- 连接断开后由业务 worker 异步删除 TCP 临时历史。
+- HTTP Session 则跨连接、跨重启持久化，详见 `AGENT_CONTEXT_MANAGEMENT_DESIGN.md`。
 
 ### 当前外部 API 调用结构
 
@@ -1345,6 +1346,9 @@ Content-Length: ...
 
 不要直接从 1000 多行的 `AgentDemo.cc` 第一行读到最后。按下面的调用链阅读：
 
+第一次学习 Agent 时，先阅读 `AGENT_LEARNING_GUIDE.md` 的术语表和天气调用示例，再进入
+下面的源码顺序。总导读解决“概念是什么”，专项设计文档解决“当前实现为什么这样做”。
+
 ```text
 1. src/main.cc::onAsyncHttpRequest
    先看 HTTP 路由如何校验 Content-Type、JSON、session_id 和 message
@@ -1358,17 +1362,44 @@ Content-Length: ...
 4. src/AgentDemo.cc::submit
    理解 inFlight、trySubmit、异常路径和 completion
 
-5. src/AgentDemo.cc::runTurn
-   理解 planner -> tool -> final answer -> history
+5. include/AgentRuntime.h + src/AgentRuntime.cc::AgentRuntime::run
+   理解原生 tool_calls -> role=tool -> 继续调用模型的有界循环
 
-6. src/AgentDemo.cc::DeepSeekClient::chat
-   理解 libcurl、超时、响应上限、RAII 和 JSON Response
+6. src/AgentDemo.cc::DeepSeekClient::complete
+   理解标准 messages/tools、libcurl、超时、RAII 和 tool_calls Response
 
 7. include/HttpServer.h + src/HttpServer.cc::onRequest
    理解 async responder、weak_ptr 和 exactly-once
 
 8. TcpConnection::forceCloseAfterWrite
    理解异步响应为什么必须“写完再关闭”
+
+9. AGENT_TOOL_CALLING_DESIGN.md
+   理解原生 Tool Calls、Registry、多步循环和执行预算
+
+10. AGENT_OBSERVABILITY_DESIGN.md
+    理解 Run ID、阶段耗时、Token usage、错误分类和安全日志
+
+11. AGENT_SSE_STREAMING_DESIGN.md
+     理解 HTTP Chunked、SSE、Provider 增量解析、背压和断连取消
+
+12. AGENT_CONTEXT_MANAGEMENT_DESIGN.md
+    理解 SQLite Turn 事务、Token Budget、滚动摘要和重启恢复
+
+13. AGENT_LEARNING_GUIDE.md
+    回到总图复盘 LLM/Agent、Session/Run/Turn、Context/Memory/RAG 和线程泳道
+
+14. AGENT_ENGINEERING_DECISIONS.md
+    按 ADR 复盘问题现象、候选方案、最终取舍、复审修复和测试证据
+
+15. AGENT_THINKING_DESIGN.md
+    理解 reasoning_content 为什么只在当前 Run 暂存、Tool Call 后如何回传和为何不展示
+
+16. AGENT_CLI_CLIENT_DESIGN.md
+    理解命令行如何自动维护 HTTP Session、解析 SSE 并展示 Agent 生命周期
+
+项目日常启动优先双击根目录 `start_agent.bat`；学习网络和进程边界时再阅读
+`tools/run_server.cmd`、`run_server.sh` 和 `stop_server.sh`。
 ```
 
 ### 本阶段核心调用链
@@ -1382,7 +1413,11 @@ curl POST /agent/run
 -> BoundedThreadPool::trySubmit
 -> IO 线程返回 EventLoop
 -> worker 执行 AgentDemoService::runTurn
--> DeepSeekClient::chat / calculator / time
+-> AgentRuntime::run
+-> DeepSeekClient::complete
+-> AgentToolRegistry::execute
+-> calculator / time / weather
+-> role=tool 结果回传 DeepSeek，直到最终回答或预算耗尽
 -> Completion(AgentResult)
 -> AsyncHttpResponder(HttpResponse)
 -> TcpConnection::send
@@ -1463,7 +1498,8 @@ A 后完成并追加
 ```text
 session 最大数量：1024
 message 最大长度：16 KiB
-单 session 历史：120 条 / 128 KiB
+成功 Turn：SQLite 持久化
+模型历史：ContextBuilder 按 8000 Token 估算预算选择
 同 session 并发：1
 ```
 
@@ -1578,6 +1614,74 @@ HTTP 客户端不保证一直复用同一 TCP 连接。如果把会话绑定到 
 Reactor/TCP > Buffer > HTTP > Agent 线程隔离 > Timer/LFU/MemoryPool
 ```
 
+### 已从 mywebserver 迁移的练习能力
+
+详细设计和验证见 `MYWEBSERVER_MIGRATION_NOTES.md`。
+
+#### Weather 工具
+
+推荐阅读：
+
+```text
+AgentDemoConfig::weatherApiBaseUrl
+-> queryWeather
+-> curl_easy_escape
+-> CurlResponse 16 KiB 上限
+-> runTurn 的 weather 分支
+```
+
+需要掌握：
+
+1. URL encoding 为什么不同于 JSON escaping？
+2. 为什么天气调用仍可使用同步 libcurl？
+3. 为什么它不会阻塞 Reactor？
+4. 为什么工具输入、超时和响应都需要上限？
+5. 工具服务失败后为什么把错误作为 toolResult，而不是让服务器崩溃？
+
+#### QPS 模式
+
+启动和压测：
+
+```bash
+./bin/main --qps --port=18082 --threads=3
+python3 tools/bench_tcp.py --port 18082 --connections 100 --requests 100000 --pipeline 100
+```
+
+推荐阅读：
+
+```text
+main.cc::QpsServer
+-> onConnection
+-> onMessage
+-> pending_ 半包缓存
+-> 批量构造 pong
+-> tools/bench_tcp.py
+```
+
+常见面试问题：
+
+1. 为什么一次 read 不能当成一次 `/ping`？
+2. pipeline 为什么能提高吞吐？
+3. pipeline 太大有什么风险？
+4. QPS 结果为什么不能代表 Agent QPS？
+5. Debug/Release、日志、连接数和系统参数如何影响压测？
+
+#### Target-based CMake
+
+推荐阅读：
+
+```text
+CMakeLists.txt
+src/CMakeLists.txt
+```
+
+需要掌握：
+
+1. `PUBLIC` 和 `PRIVATE` 依赖有什么区别？
+2. `Threads::Threads` 为什么优于直接写 `pthread`？
+3. 显式源文件列表为什么比 `file(GLOB)` 更可预测？
+4. 静态库和动态库在链接、部署方面有什么区别？
+
 ---
 
 ## 19. 建议的十二周计划
@@ -1667,7 +1771,16 @@ curl -v -X POST http://127.0.0.1:18081/health
 
 ## 21. 推荐做的最小测试
 
-当前仓库还没有正式自动化测试。学习过程中至少手工验证：
+当前仓库已经通过 CTest 提供 Runtime、SQLite、HTTP、SSE 和进程重启测试：
+
+```bash
+cmake -S . -B build -DBUILD_TESTING=ON
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
+
+阅读测试时优先使用 Fake Model 和本地 Mock，避免学习结果受公网和模型随机性影响。除了
+自动化测试，也建议手工验证以下交互：
 
 ### TCP Agent
 
@@ -1729,9 +1842,11 @@ curl -v -X POST http://127.0.0.1:18081/health
 - 暂不支持 Chunked Request Body。
 - 暂不支持 HTTPS 服务端、HTTP/2、WebSocket。
 - 暂未接入 HTTP 请求读取超时和空闲连接超时。
-- HTTP 当前提供 `/health`、`/echo` 和 `/agent/run`；异步 Agent 路由暂不复用 Keep-Alive 连接。
-- Agent 的外部 DeepSeek 调用仍可能阻塞 IO 线程。
-- 当前会话是连接级内存上下文，不是持久化长期记忆。
+- HTTP 当前提供 `/health`、`/echo`、`/agent/run`、`/agent/run/stream` 和
+  `/agent/clear`；异步 Agent 路由暂不复用 Keep-Alive 连接。
+- Agent 的外部 DeepSeek/Weather 调用会阻塞业务 worker，但不会阻塞 IO EventLoop。
+- HTTP 成功 Turn 已持久化到 SQLite，并按 Token Budget 构造上下文；当前仍是本地单用户、
+  单服务进程设计，不是带鉴权的分布式长期记忆系统。
 - TimerQueue、LFU 和内存池尚未成为网络主链路的必要组成部分。
 
 知道边界不是项目缺点。能够解释“当前做了什么、为什么这样取舍、下一步如何演进”，比声称实现了所有功能更重要。

@@ -327,7 +327,7 @@ curl_easy_init
 ```text
 连接超时：5 秒
 总超时：30 秒
-最大响应：1 MiB
+非流式 DeepSeek 完整响应：3 MiB；其中 reasoning/content 各自最多 1 MiB
 CURLOPT_NOSIGNAL：开启
 TLS 证书验证：保持 libcurl 默认开启
 ```
@@ -624,8 +624,9 @@ tcp:<connection-name> -> Session
 - 总 session 数上限 1024。
 - 容量满时淘汰最久未使用、且当前不在执行中的 session。
 - 消息最大 16 KiB。
-- 每个 session 历史最多 120 条。
-- 每个 session 历史最多 128 KiB。
+- 成功 Turn 持久化到 SQLite，内存 Session 只保存并发状态。
+- ContextBuilder 使用 8000 Token 历史估算预算，并保留最近完整 Turn。
+- 未摘要 Turn 超过 8 个时生成带 coverage 的确定性滚动摘要。
 
 ### 为什么还需要容量淘汰
 
@@ -846,6 +847,18 @@ DEEPSEEK_MODEL
 
 ## 15. HTTP API 使用方式
 
+### Weather 工具
+
+Planner 现在还可以选择：
+
+```json
+{"tool":"weather","input":"Beijing"}
+```
+
+天气请求复用现有业务线程池和 libcurl，默认访问 `https://wttr.in`。工具位置最多
+128 字节，连接超时 3 秒、总超时 8 秒、响应上限 16 KiB。可使用
+`WEATHER_API_BASE_URL` 指向本地 mock，避免测试依赖公网。
+
 ### 健康检查
 
 ```bash
@@ -986,10 +999,13 @@ ESTABLISHED_AFTER_RESPONSE=0
 2. session 只有容量淘汰，没有基于真实时间的 TTL。
 3. 停机时业务线程池会排空队列，最坏等待时间可能较长。
 4. DeepSeek 调用使用阻塞式 `curl_easy_perform()`，但已隔离到业务线程。
-5. 尚未使用 DeepSeek 官方 tool_calls，而是提示模型返回 planner JSON。
-6. 尚未实现流式 SSE。
-7. 尚未实现登录、鉴权和用户级 session 权限。
-8. 没有正式自动化测试框架，当前为 WSL 定向集成测试。
+5. 已使用 DeepSeek 原生 tool_calls，并提供 `/agent/run/stream` SSE 流式返回；当前
+   一个流仍会占用一个阻塞业务 worker，尚未升级 libcurl multi。
+6. 尚未实现登录、鉴权和用户级 session 权限。
+7. 已增加 AgentRuntime、HTTP/Provider、SSE、SQLite 和进程重启恢复测试；Session TTL、
+   多用户权限和多进程租约仍未实现。
+8. Tool Calling 有统一 60 秒 deadline；SSE 客户端断开可取消 DeepSeek/Weather，普通
+   非流式请求断开仍不会取消已运行任务。
 
 这些边界可以在面试中主动说明。主动说明取舍通常比声称所有功能都已完整实现更可信。
 
@@ -999,12 +1015,12 @@ ESTABLISHED_AFTER_RESPONSE=0
 
 如果继续开发，建议顺序：
 
-1. 增加 GoogleTest/Catch2，固定线程池和 Agent mock 测试。
-2. 为 session 增加 TimerQueue TTL 清理。
-3. 增加服务停止 API和 shutdown deadline。
-4. 实现异步 HTTP 请求序号和响应排序，恢复 Agent Keep-Alive。
-5. 使用 DeepSeek 原生 tool_calls。
-6. 增加 SSE 流式返回。
+1. 扩充线程池、HTTP 和 Session 自动化测试。
+2. 为 SSE 增加 heartbeat、写停滞 timeout 和可选断线重放。
+3. 为 429/500/503 增加受总 deadline 限制的有界重试。
+4. 为 session 增加 TimerQueue TTL 清理。
+5. 增加服务停止 API 和 shutdown deadline。
+6. 实现异步 HTTP 请求序号和响应排序，恢复 Agent Keep-Alive。
 
 暂时不建议优先做：
 
